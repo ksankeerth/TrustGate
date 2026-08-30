@@ -2,7 +2,7 @@ from app.core.contracts import VerificationState
 
 _ALLOWED_TRANSITIONS: dict[VerificationState, set[VerificationState]] = {
     VerificationState.UNVERIFIED: {VerificationState.PROVISIONAL, VerificationState.REJECTED},
-    VerificationState.PROVISIONAL: {VerificationState.VERIFIED, VerificationState.REJECTED},
+    VerificationState.PROVISIONAL: {VerificationState.PROVISIONAL, VerificationState.VERIFIED, VerificationState.REJECTED},
     VerificationState.VERIFIED: set(),
     VerificationState.REJECTED: set(),
 }

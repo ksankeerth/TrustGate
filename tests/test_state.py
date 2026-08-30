@@ -31,6 +31,15 @@ def test_rejected_reachable_from_provisional():
     assert store.get("user-1") == VerificationState.REJECTED
 
 
+def test_provisional_to_provisional_is_idempotent():
+    # A user can be re-run through the sync tier (retry, re-attempt) and land
+    # back in PROVISIONAL without that being treated as an illegal jump.
+    store = VerificationStateStore()
+    store.transition("user-1", VerificationState.PROVISIONAL)
+    store.transition("user-1", VerificationState.PROVISIONAL)
+    assert store.get("user-1") == VerificationState.PROVISIONAL
+
+
 def test_illegal_jump_unverified_to_verified_raises():
     store = VerificationStateStore()
     with pytest.raises(IllegalStateTransition):
