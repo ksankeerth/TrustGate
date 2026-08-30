@@ -15,3 +15,19 @@ class AggregatorSettings(BaseModel):
 
 
 default_settings = AggregatorSettings()
+
+
+class ChallengeSettings(BaseModel):
+    prompt_pool: list[str] = [
+        "blink",
+        "turn_left",
+        "turn_right",
+        "smile",
+        "nod",
+        "open_mouth",
+    ]
+    sequence_length: int = 3
+    ttl_seconds: int = 60
+
+
+default_challenge_settings = ChallengeSettings()
