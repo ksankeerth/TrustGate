@@ -32,6 +32,23 @@ class ChallengeSettings(BaseModel):
 
 default_challenge_settings = ChallengeSettings()
 
+
+class LivenessSettings(BaseModel):
+    min_frames: int = 2
+    # Mean per-pixel difference (0-255 scale) between the most-different pair of
+    # consecutive frames. Below this they are effectively the same picture.
+    min_pixel_delta: float = 2.0
+    # Frames are downscaled to this square size before comparison, for speed.
+    motion_sample_size: int = 64
+    # Risk floor even when every check passes: this layer is a weak demonstrator,
+    # so a clean result is never strong evidence of a live human.
+    baseline_risk: float = 0.2
+    # Confidence is capped low across the board for the same reason.
+    confidence: float = 0.35
+
+
+default_liveness_settings = LivenessSettings()
+
 # Load-either real deepfake checkpoints: both are Apache-2.0, ungated, and
 # expose a "fake"-containing label somewhere in id2label so the layer can
 # normalize native label order without per-model special-casing.

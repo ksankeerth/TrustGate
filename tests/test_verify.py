@@ -92,3 +92,20 @@ def test_verify_document_job_id_absent_when_no_id_photo():
     challenge = client.post("/challenge").json()
     response = _post_verify(challenge["challenge_id"], include_id_photo=False)
     assert response.json()["document_job_id"] is None
+
+
+def test_reusing_a_challenge_raises_the_liveness_risk():
+    """Challenges are single-use: the second attempt on one is a replay, and
+    must reach the caller as a scored risk signal rather than being silently
+    accepted at the same risk as the first.
+    """
+    challenge = client.post("/challenge").json()
+
+    first = _post_verify(challenge["challenge_id"]).json()
+    second = _post_verify(challenge["challenge_id"]).json()
+
+    def liveness_risk(body):
+        return next(layer["risk"] for layer in body["layers"] if layer["layer"] == "liveness")
+
+    assert liveness_risk(second) > liveness_risk(first)
+    assert liveness_risk(second) == 1.0

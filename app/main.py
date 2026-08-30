@@ -39,10 +39,16 @@ async def verify(
     selfie: UploadFile = File(...),
     id_photo: UploadFile | None = File(None),
     liveness_frames: list[UploadFile] = File(default=[]),
+    frame_binding: str | None = Form(None),
 ) -> VerifyResponse:
     challenge = challenge_store.get(challenge_id)
     if challenge is None or challenge_store.is_expired(challenge_id):
         raise HTTPException(status_code=400, detail="invalid or expired challenge_id")
+
+    # Consumed rather than rejected outright so a replayed challenge reaches
+    # the liveness layer as a risk signal, alongside whatever else that attempt
+    # looks like, instead of collapsing into an opaque 4xx.
+    challenge_first_use = challenge_store.consume(challenge_id)
 
     id_photo_bytes = await id_photo.read() if id_photo is not None else None
 
@@ -52,6 +58,7 @@ async def verify(
         id_photo=id_photo_bytes,
         liveness_frames=[await frame.read() for frame in liveness_frames],
         challenge=challenge,
+        metadata={"challenge_first_use": challenge_first_use, "frame_binding": frame_binding},
     )
 
     response = await orchestrator.run_sync_tier(verification_input)

@@ -8,12 +8,11 @@ asynchronous document-review tier that settles full verification later.
 ## Current status
 
 The full **challenge → verify → status → review** flow works end to end.
-Two of the four sync-tier layers (liveness, injection) are still
-**deterministic stubs** -- hash-derived mock scores, not real models -- so
-decisions from those will vary run to run rather than reflecting real
-biometric signal. Real models replace these stubs incrementally; every layer
-result already carries a `demonstrator` flag so callers can tell mock layers
-from production-grade ones.
+One of the four sync-tier layers (injection) is still a **deterministic
+stub** -- a hash-derived mock score, not a real model -- so its output will
+vary run to run rather than reflecting real signal. Real implementations
+replace the stubs incrementally; every layer result carries a `demonstrator`
+flag so callers can tell weak or mock layers from production-grade ones.
 
 **Deepfake detection is real**, but disabled by default (`DeepfakeSettings.enabled
 = False` in `app/core/config.py`) so the default test suite and app startup stay
@@ -62,6 +61,49 @@ Python, which would force a broken from-source build (or downgrade the
 torch/numpy the deepfake layer needs) if installed normally. See
 `app/layers/_vendor/facenet_pytorch/README.md` for the details and exactly
 what was changed from upstream (nothing behavioral).
+
+## Liveness: a demonstrator, and its limitations
+
+The liveness layer needs no model download, so unlike the two above it runs
+by default. It is deliberately **weak by design and self-reporting**: every
+result it emits carries `demonstrator: true` and a `reason` that spells out
+what it did and did not establish. Read its output as "nothing obviously
+wrong", never as "a live human was present".
+
+**What it actually checks** (all genuinely enforced server-side):
+
+| Check | Catches |
+|---|---|
+| Challenge exists and is unexpired | Attempts not tied to a fresh, server-issued challenge |
+| Challenge is single-use | Re-presenting an earlier attempt's `challenge_id` |
+| Frame binding (optional HMAC) | Wholesale replay of a previously captured payload |
+| Frame count | Payloads too thin to assess at all |
+| Inter-frame variation | One still image submitted as if it were a capture |
+
+**Frame binding** is an HMAC the client computes over its frames keyed by the
+challenge nonce (`compute_frame_binding` in `app/layers/liveness.py`), sent as
+the optional `frame_binding` form field on `/verify`. It proves the payload
+was assembled by something holding *this* challenge's nonce. It does **not**
+prove the frames were captured live: the nonce goes to the client in the
+clear, so anyone who can request a challenge can compute a valid binding over
+pre-recorded footage. Omitting the field is scored as a real gap, not ignored.
+
+**What it does NOT do — the honest part:**
+
+- **It does not verify the prompted actions were performed.** The challenge
+  asks for e.g. "blink, nod, open_mouth", and nothing checks that any of that
+  happened. Doing so needs real action recognition, which is out of scope here.
+- **It is not a certified presentation-attack detection control.** No iBeta or
+  equivalent testing has been done, and none is claimed.
+- **Its motion check is crude.** A mean per-pixel delta between consecutive
+  frames distinguishes a repeated still from *something* changing; it cannot
+  distinguish a live face from a video of a face, a mask, or a screen replay.
+- **A clean pass never scores zero risk.** Passing every check still returns
+  `baseline_risk` (0.2 by default), because a clean run from this layer is
+  weak evidence. Its `confidence` is likewise capped low (0.35), which the
+  aggregator uses to down-weight it against real layers.
+- **Defeating an attacker who holds a valid nonce is out of its reach.** That
+  is the injection layer's territory.
 
 ## Quickstart
 

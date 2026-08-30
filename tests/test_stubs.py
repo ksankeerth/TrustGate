@@ -7,9 +7,10 @@ from app.layers.base import VerificationInput
 from app.layers.deepfake import DeepfakeLayer
 from app.layers.face_match import FaceMatchLayer
 from app.layers.injection import InjectionLayer
-from app.layers.liveness import LivenessLayer
 
-ALL_LAYERS = [FaceMatchLayer(), LivenessLayer(), DeepfakeLayer(), InjectionLayer()]
+# Liveness is deliberately absent: it is no longer a hash-based stub but a real
+# (if deliberately weak) demonstrator, covered by tests/test_liveness.py.
+ALL_LAYERS = [FaceMatchLayer(), DeepfakeLayer(), InjectionLayer()]
 
 
 def make_input() -> VerificationInput:

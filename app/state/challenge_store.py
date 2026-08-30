@@ -11,6 +11,7 @@ class ChallengeStore:
     def __init__(self, ttl_seconds: int) -> None:
         self._ttl_seconds = ttl_seconds
         self._challenges: dict[str, Challenge] = {}
+        self._consumed: set[str] = set()
 
     def issue(self, prompt_sequence: list[str]) -> Challenge:
         challenge = Challenge(
@@ -30,3 +31,15 @@ class ChallengeStore:
         if challenge is None:
             return True
         return datetime.now(timezone.utc) >= challenge.expires_at
+
+    def consume(self, challenge_id: str) -> bool:
+        """Mark a challenge as used; return True if this was its first use.
+
+        Challenges are single-use: presenting one a second time means the
+        client is replaying an earlier attempt, which is the one replay signal
+        the server can establish on its own.
+        """
+        if challenge_id in self._consumed:
+            return False
+        self._consumed.add(challenge_id)
+        return True
