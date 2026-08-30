@@ -93,10 +93,23 @@ else
   # the entire `cd && ...` list, so bash forks a subshell for it, and that
   # subshell would otherwise inherit this script's stdout -- holding a caller's
   # pipe open (e.g. `start-all.sh | tee log` would never return).
-  (set -m; { cd "$THUNDERID_HOME" && nohup ./start.sh; } >"$THUNDERID_LOG" 2>&1 </dev/null &
+  (set -m; { cd "$THUNDERID_HOME" && nohup ./start.sh "$THUNDERID_RESOURCES_FILE"; } >"$THUNDERID_LOG" 2>&1 </dev/null &
    echo $! >"$THUNDERID_PID_FILE")
 
   wait_for "ThunderID" "$THUNDERID_BASE_URL/health/liveness" "$THUNDERID_LOG" "$THUNDERID_PID_FILE" 90 || exit 1
+fi
+
+# ThunderID discards user attributes that are not declared on the user type
+# schema -- silently, with a 200 response -- so this must succeed before
+# TrustGate can write verification state. Idempotent.
+echo "Provisioning ThunderID (verification_status attribute)..."
+if ! "$PROJECT_ROOT/.venv/bin/python3" "$DEPLOYMENT_DIR/provision_thunderid.py" \
+      --base-url "$THUNDERID_BASE_URL" \
+      --client-id "$TRUSTGATE_CLIENT_ID" \
+      --client-secret "$TRUSTGATE_CLIENT_SECRET" \
+      --resource "$THUNDERID_RESOURCE_ID" 2>&1 | sed 's/^/  /'; then
+  echo "error: provisioning failed -- TrustGate attribute writes would be silently dropped" >&2
+  exit 1
 fi
 
 # --- TrustGate ---------------------------------------------------------------

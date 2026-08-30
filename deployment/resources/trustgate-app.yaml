@@ -1,0 +1,49 @@
+# Registers TrustGate as a machine-to-machine application in ThunderID, so the
+# service can obtain a client-credentials token for the User Management API.
+#
+# Field names and allowed values come from ThunderID's own OpenAPI spec
+# (api/application.yaml): type is one of browser|fullstack|mobile|m2m|mcp|custom,
+# and the client_credentials grant requires a confidential client, i.e. a
+# tokenEndpointAuthMethod other than "none".
+#
+# The ouId is the "default" organization unit seeded by ThunderID's bootstrap.
+# The clientSecret here is a local demo credential and nothing more.
+resource_type: application
+id: 01900000-0000-7000-8000-0000000000f0
+name: TrustGate
+description: TrustGate identity verification service (machine-to-machine)
+type: m2m
+ouId: 01900000-0000-7000-8000-000000000001
+inboundAuthConfig:
+  - type: oauth2
+    config:
+      clientId: TRUSTGATE
+      clientSecret: trustgate-local-client-secret
+      grantTypes:
+        - client_credentials
+      tokenEndpointAuthMethod: client_secret_basic
+      publicClient: false
+      scopes:
+        - system
+---
+# Declaring `scopes` above only says what the client may ask for. Actually
+# granting access is role-based: a role carries permissions on a resource
+# server, and entities are assigned to it. This is a dedicated role rather than
+# an assignment onto the built-in Administrator role, so TrustGate's access can
+# be inspected and revoked on its own.
+#
+# resourceServerId is the "System" resource server seeded by bootstrap, whose
+# identifier is https://localhost:8090/mcp -- that value must also be sent as
+# the RFC 8707 `resource` parameter when requesting the token.
+resource_type: role
+id: 01900000-0000-7000-8000-0000000000f1
+name: TrustGate Service
+description: Grants TrustGate the system permission needed for user attribute updates
+ouHandle: default
+permissions:
+  - resourceServerId: 01900000-0000-7000-8000-000000000020
+    permissions:
+      - system
+assignments:
+  - id: 01900000-0000-7000-8000-0000000000f0
+    type: app

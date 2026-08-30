@@ -50,3 +50,13 @@ THUNDERID_ZIP="${THUNDERID_DIST_NAME}.zip"
 THUNDERID_URL="https://github.com/thunder-id/thunderid/releases/download/v${THUNDERID_VERSION}/${THUNDERID_ZIP}"
 THUNDERID_HOME="$DIST_DIR/$THUNDERID_DIST_NAME"
 THUNDERID_BASE_URL="https://localhost:${THUNDERID_PORT}"
+
+# Declarative resources applied at startup: registers TrustGate as an m2m
+# application and grants it the system permission via a role.
+THUNDERID_RESOURCES_FILE="${THUNDERID_RESOURCES_FILE:-$DEPLOYMENT_DIR/resources/trustgate-app.yaml}"
+
+# The System resource server identifier, required as the RFC 8707 `resource`
+# parameter on token requests.
+THUNDERID_RESOURCE_ID="${THUNDERID_RESOURCE_ID:-https://localhost:${THUNDERID_PORT}/mcp}"
+TRUSTGATE_CLIENT_ID="${TRUSTGATE_CLIENT_ID:-TRUSTGATE}"
+TRUSTGATE_CLIENT_SECRET="${TRUSTGATE_CLIENT_SECRET:-trustgate-local-client-secret}"
