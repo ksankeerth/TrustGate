@@ -6,11 +6,12 @@ from app.core.contracts import Challenge, LayerResult
 from app.layers.base import VerificationInput
 from app.layers.deepfake import DeepfakeLayer
 from app.layers.face_match import FaceMatchLayer
-from app.layers.injection import InjectionLayer
 
-# Liveness is deliberately absent: it is no longer a hash-based stub but a real
-# (if deliberately weak) demonstrator, covered by tests/test_liveness.py.
-ALL_LAYERS = [FaceMatchLayer(), DeepfakeLayer(), InjectionLayer()]
+# Only the two layers that still have a mock default remain here; each stands in
+# for a real implementation kept behind an enable flag. Liveness and injection
+# are deliberately absent -- they are real (if weak) demonstrators now, covered
+# by tests/test_liveness.py and tests/test_injection.py.
+ALL_LAYERS = [FaceMatchLayer(), DeepfakeLayer()]
 
 
 def make_input() -> VerificationInput:

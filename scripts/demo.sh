@@ -5,7 +5,6 @@ set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://127.0.0.1:8000}"
 USER_REF="${USER_REF:-demo-user-$(date +%s)}"
-SAMPLES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../samples" && pwd)"
 
 FRAMES_DIR="$(mktemp -d)"
 trap 'rm -rf "$FRAMES_DIR"' EXIT
@@ -20,22 +19,36 @@ echo "$CHALLENGE_JSON"
 CHALLENGE_ID=$(echo "$CHALLENGE_JSON" | json_field challenge_id)
 NONCE=$(echo "$CHALLENGE_JSON" | json_field nonce)
 
-# A real client would capture these while performing the prompted actions.
-# Two frames of differing brightness stand in, so the liveness layer's
-# inter-frame variation check sees something other than one repeated still.
+# Synthetic stand-ins for what a real client would capture -- NOT real faces.
+# They carry per-pixel noise and camera EXIF so the liveness and injection
+# demonstrators see something shaped like a genuine capture; the frames differ
+# in brightness so the inter-frame variation check sees actual change. The
+# face-match and deepfake layers are off by default, so no real face is needed.
 echo
-echo "== 2) Generate liveness frames and bind them to the challenge nonce =="
+echo "== 2) Generate capture images and bind the frames to the challenge nonce =="
 python3 - "$FRAMES_DIR" "$NONCE" <<'PY'
-import hashlib, hmac, sys
+import hashlib, hmac, random, sys
 from PIL import Image
 
 frames_dir, nonce = sys.argv[1], sys.argv[2]
-frames = []
-for index, brightness in enumerate((40, 200)):
-    path = f"{frames_dir}/frame_{index}.jpg"
-    Image.new("RGB", (96, 96), (brightness,) * 3).save(path, format="JPEG")
+
+
+def capture(path, seed, size=160):
+    rng = random.Random(seed)
+    image = Image.new("RGB", (size, size))
+    image.putdata([(rng.randint(0, 255),) * 3 for _ in range(size * size)])
+    exif = Image.Exif()
+    exif[271] = "DemoPhone"
+    exif[272] = "DemoPhone 15"
+    exif[306] = "2026:08:30 10:00:00"
+    image.save(path, format="JPEG", exif=exif, quality=95)
     with open(path, "rb") as handle:
-        frames.append(handle.read())
+        return handle.read()
+
+
+capture(f"{frames_dir}/selfie.jpg", seed=1)
+capture(f"{frames_dir}/id_photo.jpg", seed=2)
+frames = [capture(f"{frames_dir}/frame_{i}.jpg", seed=10 + i) for i in range(2)]
 
 binding = hmac.new(nonce.encode(), b"".join(frames), hashlib.sha256).hexdigest()
 with open(f"{frames_dir}/binding.txt", "w") as handle:
@@ -50,8 +63,8 @@ VERIFY_JSON=$(curl -sf -X POST "$BASE_URL/verify" \
   -F "challenge_id=$CHALLENGE_ID" \
   -F "user_ref=$USER_REF" \
   -F "frame_binding=$FRAME_BINDING" \
-  -F "selfie=@$SAMPLES_DIR/demo_selfie.txt" \
-  -F "id_photo=@$SAMPLES_DIR/demo_id_photo.txt" \
+  -F "selfie=@$FRAMES_DIR/selfie.jpg" \
+  -F "id_photo=@$FRAMES_DIR/id_photo.jpg" \
   -F "liveness_frames=@$FRAMES_DIR/frame_0.jpg" \
   -F "liveness_frames=@$FRAMES_DIR/frame_1.jpg")
 echo "$VERIFY_JSON"

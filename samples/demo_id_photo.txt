@@ -1,2 +1,0 @@
-placeholder ID photo payload for demo purposes -- not a real document image;
-see samples/demo_selfie.txt for why plain bytes are fine at this stage.

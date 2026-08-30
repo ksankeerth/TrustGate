@@ -49,6 +49,38 @@ class LivenessSettings(BaseModel):
 
 default_liveness_settings = LivenessSettings()
 
+
+class InjectionSettings(BaseModel):
+    # Substrings matched case-insensitively against EXIF Software/processing
+    # tags. Presence proves the image passed through one of these, not that an
+    # injection occurred -- plenty of benign pipelines re-encode.
+    suspicious_software_markers: list[str] = [
+        "ffmpeg",
+        "obs",
+        "manycam",
+        "epoccam",
+        "droidcam",
+        "virtual",
+        "screen capture",
+        "screenrecord",
+        "photoshop",
+        "gimp",
+        "stable diffusion",
+        "midjourney",
+    ]
+    # Mean absolute adjacent-pixel gradient. Real sensor output is noisy; a
+    # value under this is implausibly smooth for a camera capture.
+    min_sensor_noise: float = 1.0
+    noise_sample_size: int = 128
+    # Higher floor than liveness: server-side injection detection is weaker
+    # still, so even a clean pass carries meaningful residual risk.
+    baseline_risk: float = 0.3
+    # The lowest confidence of any layer, by design.
+    confidence: float = 0.2
+
+
+default_injection_settings = InjectionSettings()
+
 # Load-either real deepfake checkpoints: both are Apache-2.0, ungated, and
 # expose a "fake"-containing label somewhere in id2label so the layer can
 # normalize native label order without per-model special-casing.

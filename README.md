@@ -7,12 +7,22 @@ asynchronous document-review tier that settles full verification later.
 
 ## Current status
 
-The full **challenge → verify → status → review** flow works end to end.
-One of the four sync-tier layers (injection) is still a **deterministic
-stub** -- a hash-derived mock score, not a real model -- so its output will
-vary run to run rather than reflecting real signal. Real implementations
-replace the stubs incrementally; every layer result carries a `demonstrator`
-flag so callers can tell weak or mock layers from production-grade ones.
+The full **challenge → verify → status → review** flow works end to end, and
+all four sync-tier layers are now implemented:
+
+| Layer | Status | Default |
+|---|---|---|
+| Face match | Real (MTCNN + InceptionResnetV1) | Off -- mock stub runs instead |
+| Deepfake | Real (SigLIP2 / ViT classifier) | Off -- mock stub runs instead |
+| Liveness | Real, **demonstrator** | On |
+| Injection | Real, **demonstrator** | On |
+
+The two model-backed layers are off by default so the test suite and app
+startup stay fast and download-free; enable them explicitly (see below). The
+two demonstrator layers need no model and run by default, but are deliberately
+weak -- see their limitations sections. Every layer result carries a
+`demonstrator` flag so callers can tell weak or mock layers from
+production-grade ones, and the aggregator down-weights both.
 
 **Deepfake detection is real**, but disabled by default (`DeepfakeSettings.enabled
 = False` in `app/core/config.py`) so the default test suite and app startup stay
@@ -103,7 +113,47 @@ pre-recorded footage. Omitting the field is scored as a real gap, not ignored.
   weak evidence. Its `confidence` is likewise capped low (0.35), which the
   aggregator uses to down-weight it against real layers.
 - **Defeating an attacker who holds a valid nonce is out of its reach.** That
-  is the injection layer's territory.
+  is nominally the injection layer's territory -- and, as the next section
+  explains, largely beyond its reach too.
+
+## Injection detection: the weakest layer here
+
+**Injection** means bypassing the camera altogether -- a virtual camera,
+emulator, or feeding frames straight to the API -- as distinct from a
+*presentation* attack held up to a real lens. It also runs by default and needs
+no model.
+
+Be clear-eyed about this one: **detecting injection from uploaded stills is
+close to a lost cause.** Every signal available server-side is either trivially
+forgeable or routinely absent on genuine traffic. Production systems address
+injection with **client attestation** (Play Integrity, App Attest, hardware-backed
+key attestation) proving the frames came from a real camera on an untampered
+device. This service receives an HTTP upload and cannot attest anything about
+its origin. What follows is a best-effort demonstrator, scored to be leaned on
+least: the **lowest confidence of any layer (0.2)** and the **highest baseline
+risk (0.3)**.
+
+**What it looks at:**
+
+| Signal | Rationale | Why it's weak |
+|---|---|---|
+| EXIF `Software` tag vs. known encoder/virtual-camera markers | Injection tooling often leaves a trace | Trivially stripped or spoofed |
+| Missing camera make/model | Synthetic frames often carry no camera metadata | Many legitimate clients strip EXIF for privacy |
+| Missing capture timestamp | Incomplete provenance | Same as above |
+| Identical frame byte lengths | Independently encoded camera frames rarely match exactly | Easy to vary deliberately |
+| Sensor-noise floor | Real sensors are never perfectly smooth; renders often are | A photo of a blank wall scores low; noise is easy to add |
+| Frame dimension disagreement | One capture session should be internally consistent | Easy to normalise |
+
+**What it does NOT do:**
+
+- **It cannot establish that frames came from a real camera.** Only attestation
+  can, and that is a client-side capability this service does not have.
+- **Expect modest accuracy in both directions.** A privacy-conscious client that
+  strips EXIF looks suspicious; a careful attacker who forges plausible metadata
+  and adds noise looks clean. Do not tune a hard gate on this layer's output.
+- **A clean pass never scores zero risk**, for the same reason as liveness: at
+  `baseline_risk` 0.3, absence of evidence is not evidence of absence.
+- **No certification is claimed.**
 
 ## Quickstart
 
