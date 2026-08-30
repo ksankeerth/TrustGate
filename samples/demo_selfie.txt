@@ -1,0 +1,4 @@
+placeholder selfie payload for demo purposes -- not a real image; the current
+sync layers are deterministic stubs (hash-derived scores), not real models, so
+any bytes work here. Replace with a real selfie once the real face-match and
+deepfake layers land.

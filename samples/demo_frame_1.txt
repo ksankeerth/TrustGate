@@ -1,0 +1,2 @@
+placeholder liveness-frame payload for demo purposes -- not a real video
+frame; see samples/demo_selfie.txt for why plain bytes are fine at this stage.
