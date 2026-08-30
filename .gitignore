@@ -59,4 +59,9 @@ samples/face_match_eval/
 /.weights/
 /models/
 .cache/
+
+# Downloaded ThunderID distribution (~100MB unpacked) and runtime state.
+# Recreate with ./deployment/fetch-thunderid.sh
+deployment/dist/
+deployment/run/
 .claude/
