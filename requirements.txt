@@ -2,5 +2,6 @@ fastapi
 uvicorn[standard]
 pydantic
 pytest
+pytest-asyncio
 httpx
 pillow
