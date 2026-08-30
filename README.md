@@ -8,12 +8,38 @@ asynchronous document-review tier that settles full verification later.
 ## Current status
 
 The full **challenge → verify → status → review** flow works end to end.
-The four sync-tier layers (face match, liveness, deepfake, injection) are
-currently **deterministic stubs** -- hash-derived mock scores, not real
-models -- so decisions will vary run to run rather than reflecting real
+Three of the four sync-tier layers (face match, liveness, injection) are
+still **deterministic stubs** -- hash-derived mock scores, not real models --
+so decisions from those will vary run to run rather than reflecting real
 biometric signal. Real models replace these stubs incrementally; every layer
 result already carries a `demonstrator` flag so callers can tell mock layers
-from production-grade ones once real layers land.
+from production-grade ones.
+
+**Deepfake detection is real**, but disabled by default (`DeepfakeSettings.enabled
+= False` in `app/core/config.py`) so the default test suite and app startup stay
+fast and network-free. It supports two interchangeable open-source checkpoints
+(both Apache-2.0, ungated):
+
+| `model_choice` | Checkpoint | Base |
+|---|---|---|
+| `vit` (default) | `prithivMLmods/Deep-Fake-Detector-v2-Model` | `google/vit-base-patch16-224-in21k` |
+| `siglip2` | `prithivMLmods/Deepfake-Detect-Siglip2` | `google/siglip2-base-patch16-224` |
+
+Each checkpoint's native label order is normalized inside the layer to a
+canonical `fake_probability` -> `risk`, so the aggregator never needs to know
+which checkpoint is active. Model weights cache to `.cache/huggingface/`
+(project-local, gitignored) rather than the default `~/.cache/huggingface`.
+
+To enable it, set `DeepfakeSettings.enabled = True` (and optionally
+`model_choice`, `device`) before the app builds its default layer list.
+**As with any deepfake classifier, treat its output as a risk signal, not a
+verdict** -- it does not generalize to unseen generators.
+
+Its dedicated test (`tests/test_deepfake_real.py`, marked `slow`, excluded
+from the default `pytest` run) needs two local images it does not ship with
+the repo -- `samples/deepfake_eval/known_real.jpg` and `known_fake.jpg`
+(gitignored) -- since real face photos and deepfake samples shouldn't be
+committed to a public repo. Add your own to run it: `pytest -m slow`.
 
 ## Quickstart
 

@@ -6,3 +6,6 @@ pytest-asyncio
 httpx
 pillow
 python-multipart
+torch
+torchvision
+transformers

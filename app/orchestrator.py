@@ -1,16 +1,24 @@
 import asyncio
 
+from app.core.config import default_deepfake_settings
 from app.core.contracts import Decision, VerifyResponse
 from app.core.contracts import VerificationState as State
 from app.layers.base import Layer, VerificationInput
-from app.layers.deepfake import DeepfakeLayer
+from app.layers.deepfake import DeepfakeLayer, RealDeepfakeLayer
 from app.layers.face_match import FaceMatchLayer
 from app.layers.injection import InjectionLayer
 from app.layers.liveness import LivenessLayer
 from app.scoring.aggregator import aggregate
 from app.state.store import VerificationStateStore
 
-DEFAULT_SYNC_LAYERS: list[Layer] = [FaceMatchLayer(), LivenessLayer(), DeepfakeLayer(), InjectionLayer()]
+
+def _build_deepfake_layer() -> Layer:
+    if default_deepfake_settings.enabled:
+        return RealDeepfakeLayer(default_deepfake_settings)
+    return DeepfakeLayer()
+
+
+DEFAULT_SYNC_LAYERS: list[Layer] = [FaceMatchLayer(), LivenessLayer(), _build_deepfake_layer(), InjectionLayer()]
 
 
 class Orchestrator:

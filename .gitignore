@@ -54,5 +54,8 @@ htmlcov/
 samples/**/*.jpg
 samples/**/*.png
 samples/**/*.jpeg
+samples/deepfake_eval/
 .weights/
 models/
+.cache/
+.claude/

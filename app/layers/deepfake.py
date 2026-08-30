@@ -1,8 +1,20 @@
+import asyncio
+import io
+import logging
+import time
+
+from app.core.config import DEEPFAKE_MODEL_CHECKPOINTS, DeepfakeSettings, default_deepfake_settings
 from app.core.contracts import LayerResult
 from app.layers.base import Layer, VerificationInput, deterministic_unit_score
 
+logger = logging.getLogger(__name__)
+
 
 class DeepfakeLayer(Layer):
+    """Deterministic mock used by default so the sync tier stays fast and
+    dependency-free for tests. See RealDeepfakeLayer for the real classifier.
+    """
+
     name = "deepfake"
 
     async def run(self, verification_input: VerificationInput) -> LayerResult:
@@ -15,4 +27,99 @@ class DeepfakeLayer(Layer):
             reason="stub: mock fake-probability score, no real classifier wired yet",
             detail={"selfie_present": verification_input.selfie is not None},
             demonstrator=True,
+        )
+
+
+_MODEL_CACHE: dict[str, tuple] = {}
+
+
+def _load_model(checkpoint: str, cache_dir: str) -> tuple:
+    """Load (and cache) the processor/model pair for a checkpoint.
+
+    Imports transformers/torch lazily so importing this module never pulls
+    in those heavy dependencies unless a RealDeepfakeLayer is actually built.
+    """
+    from transformers import AutoImageProcessor, AutoModelForImageClassification
+
+    if checkpoint not in _MODEL_CACHE:
+        processor = AutoImageProcessor.from_pretrained(checkpoint, cache_dir=cache_dir)
+        model = AutoModelForImageClassification.from_pretrained(checkpoint, cache_dir=cache_dir)
+        model.eval()
+        _MODEL_CACHE[checkpoint] = (processor, model)
+    return _MODEL_CACHE[checkpoint]
+
+
+def _find_fake_label_index(id2label: dict) -> int:
+    """Normalize a model's native label order to the index meaning 'fake'.
+
+    Both currently supported checkpoints happen to spell it "Fake" or
+    "Deepfake" -- either way the substring match finds it without needing
+    per-model special-casing. Falls back to whichever label doesn't look
+    like "real" if no label contains "fake".
+    """
+    for idx, label in id2label.items():
+        if "fake" in label.lower():
+            return int(idx)
+    return next((int(idx) for idx, label in id2label.items() if "real" not in label.lower()), 1)
+
+
+class RealDeepfakeLayer(Layer):
+    """Load-either SigLIP2/ViT deepfake classifier.
+
+    Not wired into the default sync tier (see DeepfakeSettings.enabled) so
+    the fast test suite and default app startup stay model-download-free;
+    opt in explicitly for real inference.
+    """
+
+    name = "deepfake"
+
+    def __init__(self, settings: DeepfakeSettings = default_deepfake_settings) -> None:
+        self._settings = settings
+        self._checkpoint = DEEPFAKE_MODEL_CHECKPOINTS[settings.model_choice]
+        self._processor, self._model = _load_model(self._checkpoint, settings.cache_dir)
+        self._fake_index = _find_fake_label_index(self._model.config.id2label)
+        self._model.to(settings.device)
+
+    def _predict(self, image_bytes: bytes) -> tuple[float, float, float]:
+        import torch
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        inputs = self._processor(images=image, return_tensors="pt").to(self._settings.device)
+
+        start = time.monotonic()
+        with torch.no_grad():
+            logits = self._model(**inputs).logits
+        elapsed_ms = (time.monotonic() - start) * 1000
+
+        probs = torch.softmax(logits, dim=-1)[0]
+        fake_probability = probs[self._fake_index].item()
+        confidence = probs.max().item()
+        return fake_probability, confidence, elapsed_ms
+
+    async def run(self, verification_input: VerificationInput) -> LayerResult:
+        if verification_input.selfie is None:
+            return LayerResult(
+                layer=self.name,
+                risk=0.5,
+                confidence=0.0,
+                ok=False,
+                reason="no selfie provided",
+                demonstrator=False,
+            )
+
+        fake_probability, confidence, elapsed_ms = await asyncio.to_thread(self._predict, verification_input.selfie)
+        logger.info("deepfake layer (%s) inference took %.1fms", self._checkpoint, elapsed_ms)
+
+        return LayerResult(
+            layer=self.name,
+            risk=fake_probability,
+            confidence=confidence,
+            ok=fake_probability < 0.5,
+            reason=(
+                f"{self._checkpoint}: fake_probability={fake_probability:.3f} "
+                "(does not generalize to unseen generators -- treat as a signal, not a verdict)"
+            ),
+            detail={"checkpoint": self._checkpoint, "inference_ms": round(elapsed_ms, 1)},
+            demonstrator=False,
         )
