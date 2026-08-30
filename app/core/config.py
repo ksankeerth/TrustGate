@@ -49,3 +49,15 @@ class DeepfakeSettings(BaseModel):
 
 
 default_deepfake_settings = DeepfakeSettings()
+
+
+class FaceMatchSettings(BaseModel):
+    enabled: bool = False  # off by default: keeps the default sync-tier wiring fast/deterministic for tests
+    pretrained: str = "vggface2"  # or "casia-webface" (both from facenet-pytorch, MIT licensed)
+    similarity_threshold: float = 0.5  # cosine similarity at/above which the pair is treated as a match
+    similarity_floor: float = 0.0  # cosine similarity at/below which risk saturates at 1.0
+    device: str = "cpu"
+    cache_dir: str = ".cache/torch"
+
+
+default_face_match_settings = FaceMatchSettings()

@@ -2,12 +2,15 @@ import asyncio
 import io
 import logging
 import time
+from pathlib import Path
 
 from app.core.config import DEEPFAKE_MODEL_CHECKPOINTS, DeepfakeSettings, default_deepfake_settings
 from app.core.contracts import LayerResult
 from app.layers.base import Layer, VerificationInput, deterministic_unit_score
 
 logger = logging.getLogger(__name__)
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class DeepfakeLayer(Layer):
@@ -30,23 +33,43 @@ class DeepfakeLayer(Layer):
         )
 
 
-_MODEL_CACHE: dict[str, tuple] = {}
+_MODEL_CACHE: dict[tuple[str, str, str], tuple] = {}
 
 
-def _load_model(checkpoint: str, cache_dir: str) -> tuple:
+def _resolve_cache_dir(cache_dir: str) -> str:
+    """Resolve a relative cache_dir against the project root.
+
+    Without this, the weights directory would be interpreted relative to the
+    process's working directory, so starting the service from elsewhere would
+    silently re-download the model into a different location.
+    """
+    path = Path(cache_dir)
+    if not path.is_absolute():
+        path = _PROJECT_ROOT / path
+    return str(path)
+
+
+def _load_model(checkpoint: str, cache_dir: str, device: str) -> tuple:
     """Load (and cache) the processor/model pair for a checkpoint.
 
     Imports transformers/torch lazily so importing this module never pulls
     in those heavy dependencies unless a RealDeepfakeLayer is actually built.
+
+    Cached per (checkpoint, cache_dir, device): device is part of the key
+    because the model is moved onto it at construction, so sharing one
+    instance across devices would leave whichever layer was built first
+    pointing at tensors on the wrong device.
     """
     from transformers import AutoImageProcessor, AutoModelForImageClassification
 
-    if checkpoint not in _MODEL_CACHE:
-        processor = AutoImageProcessor.from_pretrained(checkpoint, cache_dir=cache_dir)
-        model = AutoModelForImageClassification.from_pretrained(checkpoint, cache_dir=cache_dir)
-        model.eval()
-        _MODEL_CACHE[checkpoint] = (processor, model)
-    return _MODEL_CACHE[checkpoint]
+    resolved_cache_dir = _resolve_cache_dir(cache_dir)
+    key = (checkpoint, resolved_cache_dir, device)
+    if key not in _MODEL_CACHE:
+        processor = AutoImageProcessor.from_pretrained(checkpoint, cache_dir=resolved_cache_dir)
+        model = AutoModelForImageClassification.from_pretrained(checkpoint, cache_dir=resolved_cache_dir)
+        model.eval().to(device)
+        _MODEL_CACHE[key] = (processor, model)
+    return _MODEL_CACHE[key]
 
 
 def _find_fake_label_index(id2label: dict) -> int:
@@ -76,9 +99,8 @@ class RealDeepfakeLayer(Layer):
     def __init__(self, settings: DeepfakeSettings = default_deepfake_settings) -> None:
         self._settings = settings
         self._checkpoint = DEEPFAKE_MODEL_CHECKPOINTS[settings.model_choice]
-        self._processor, self._model = _load_model(self._checkpoint, settings.cache_dir)
+        self._processor, self._model = _load_model(self._checkpoint, settings.cache_dir, settings.device)
         self._fake_index = _find_fake_label_index(self._model.config.id2label)
-        self._model.to(settings.device)
 
     def _predict(self, image_bytes: bytes) -> tuple[float, float, float]:
         import torch
@@ -99,16 +121,34 @@ class RealDeepfakeLayer(Layer):
 
     async def run(self, verification_input: VerificationInput) -> LayerResult:
         if verification_input.selfie is None:
+            # Full confidence, not 0: the aggregator scales layer weight by
+            # confidence, so a 0 here would drop this layer out of the score
+            # entirely rather than registering that it could not be run.
             return LayerResult(
                 layer=self.name,
-                risk=0.5,
-                confidence=0.0,
+                risk=1.0,
+                confidence=1.0,
                 ok=False,
-                reason="no selfie provided",
+                reason="cannot screen for deepfakes: no selfie provided",
                 demonstrator=False,
             )
 
-        fake_probability, confidence, elapsed_ms = await asyncio.to_thread(self._predict, verification_input.selfie)
+        try:
+            fake_probability, confidence, elapsed_ms = await asyncio.to_thread(self._predict, verification_input.selfie)
+        except Exception:
+            # Undecodable/corrupt image bytes and inference failures must not
+            # escape: the orchestrator gathers layers without return_exceptions,
+            # so an exception here would fail the whole /verify request.
+            logger.exception("deepfake layer failed")
+            return LayerResult(
+                layer=self.name,
+                risk=1.0,
+                confidence=1.0,
+                ok=False,
+                reason="cannot screen for deepfakes: selfie could not be processed",
+                demonstrator=False,
+            )
+
         logger.info("deepfake layer (%s) inference took %.1fms", self._checkpoint, elapsed_ms)
 
         return LayerResult(

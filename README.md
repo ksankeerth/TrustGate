@@ -8,9 +8,9 @@ asynchronous document-review tier that settles full verification later.
 ## Current status
 
 The full **challenge → verify → status → review** flow works end to end.
-Three of the four sync-tier layers (face match, liveness, injection) are
-still **deterministic stubs** -- hash-derived mock scores, not real models --
-so decisions from those will vary run to run rather than reflecting real
+Two of the four sync-tier layers (liveness, injection) are still
+**deterministic stubs** -- hash-derived mock scores, not real models -- so
+decisions from those will vary run to run rather than reflecting real
 biometric signal. Real models replace these stubs incrementally; every layer
 result already carries a `demonstrator` flag so callers can tell mock layers
 from production-grade ones.
@@ -40,6 +40,28 @@ from the default `pytest` run) needs two local images it does not ship with
 the repo -- `samples/deepfake_eval/known_real.jpg` and `known_fake.jpg`
 (gitignored) -- since real face photos and deepfake samples shouldn't be
 committed to a public repo. Add your own to run it: `pytest -m slow`.
+
+**Face match is also real**, same pattern: disabled by default
+(`FaceMatchSettings.enabled = False`). It uses MTCNN (face
+detection/crop/alignment) and `InceptionResnetV1` (pretrained on `vggface2`
+by default, or `casia-webface`) for embeddings, and cosine similarity
+between the selfie and ID-photo embeddings maps to risk (low similarity =
+high risk, threshold configurable). Weights cache to `.cache/torch/`
+(project-local, via `TORCH_HOME`). If no face is detected in either image,
+the layer reports maximum risk rather than erroring.
+
+Its dedicated test (`tests/test_face_match_real.py`, also `slow`) needs three
+local images -- `samples/face_match_eval/same_person_a.jpg`, `same_person_b.jpg`,
+and `different_person.jpg` (gitignored) -- for the same reason as above.
+
+The MTCNN/InceptionResnetV1 code itself is vendored from `facenet-pytorch`
+(MIT licensed) into `app/layers/_vendor/facenet_pytorch/` rather than taken
+as an ordinary dependency -- its latest PyPI release pins `torch<2.3.0` /
+`numpy<2.0.0` / `Pillow<10.3.0`, versions with no prebuilt wheels for recent
+Python, which would force a broken from-source build (or downgrade the
+torch/numpy the deepfake layer needs) if installed normally. See
+`app/layers/_vendor/facenet_pytorch/README.md` for the details and exactly
+what was changed from upstream (nothing behavioral).
 
 ## Quickstart
 

@@ -55,7 +55,8 @@ samples/**/*.jpg
 samples/**/*.png
 samples/**/*.jpeg
 samples/deepfake_eval/
-.weights/
-models/
+samples/face_match_eval/
+/.weights/
+/models/
 .cache/
 .claude/
