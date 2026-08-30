@@ -8,6 +8,7 @@ class DocumentJob:
     user_ref: str
     id_photo: bytes
     status: str = "PENDING"
+    reviewer_note: str | None = None
 
 
 class DocumentJobStore:
@@ -23,3 +24,11 @@ class DocumentJobStore:
 
     def get(self, job_id: str) -> DocumentJob | None:
         return self._jobs.get(job_id)
+
+    def settle(self, job_id: str, status: str, reviewer_note: str | None) -> DocumentJob | None:
+        job = self._jobs.get(job_id)
+        if job is None:
+            return None
+        job.status = status
+        job.reviewer_note = reviewer_note
+        return job

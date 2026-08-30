@@ -43,3 +43,13 @@ class VerifyResponse(BaseModel):
     reasons: list[str] = Field(default_factory=list)
     layers: list[LayerResult] = Field(default_factory=list)
     document_job_id: str | None = None
+
+
+class StatusResponse(BaseModel):
+    user_ref: str
+    state: VerificationState
+
+
+class ReviewRequest(BaseModel):
+    decision: Decision
+    reviewer_note: str | None = None
