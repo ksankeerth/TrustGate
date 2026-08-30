@@ -108,6 +108,21 @@ class ThunderIdSettings(BaseModel):
 
 default_thunderid_settings = ThunderIdSettings()
 
+
+class LatencySettings(BaseModel):
+    """Budgets for the synchronous tier.
+
+    The caller's HTTP-request executor imposes a hard ceiling; exceeding it
+    fails the login flow rather than merely being slow. The budget is the
+    internal target that leaves headroom under that ceiling.
+    """
+
+    budget_ms: float = 5000.0
+    hard_ceiling_ms: float = 20000.0
+
+
+default_latency_settings = LatencySettings()
+
 # Load-either real deepfake checkpoints: both are Apache-2.0, ungated, and
 # expose a "fake"-containing label somewhere in id2label so the layer can
 # normalize native label order without per-model special-casing.

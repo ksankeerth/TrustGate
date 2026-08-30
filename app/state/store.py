@@ -26,6 +26,14 @@ class VerificationStateStore:
     def get(self, user_ref: str) -> VerificationState:
         return self._states.get(user_ref, VerificationState.UNVERIFIED)
 
+    def is_settled(self, user_ref: str) -> bool:
+        """True once the user has reached a terminal state.
+
+        Lets callers refuse work up front rather than discovering the illegal
+        transition only after the expensive part has already run.
+        """
+        return not _ALLOWED_TRANSITIONS[self.get(user_ref)]
+
     def transition(self, user_ref: str, to_state: VerificationState) -> VerificationState:
         current = self.get(user_ref)
         if to_state not in _ALLOWED_TRANSITIONS[current]:

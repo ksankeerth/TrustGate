@@ -33,6 +33,9 @@ class LayerResult(BaseModel):
     reason: str
     detail: dict[str, Any] = Field(default_factory=dict)
     demonstrator: bool = False
+    # Wall-clock time for this layer, filled in by the orchestrator that
+    # scheduled it -- a layer does not time itself.
+    duration_ms: float | None = None
 
 
 class Challenge(BaseModel):
@@ -50,6 +53,9 @@ class VerifyResponse(BaseModel):
     reasons: list[str] = Field(default_factory=list)
     layers: list[LayerResult] = Field(default_factory=list)
     document_job_id: str | None = None
+    # Wall-clock time for the whole sync tier. Because the layers run
+    # concurrently this is close to the slowest layer, not the sum of them.
+    total_duration_ms: float | None = None
 
 
 class StatusResponse(BaseModel):

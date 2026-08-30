@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
 from app.core.config import default_challenge_settings
+from app.core.logging import configure_logging
 from app.core.contracts import (
     Challenge,
     Decision,
@@ -31,6 +32,7 @@ document_worker = DocumentReviewWorker(document_job_store, state_store, thunderi
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    configure_logging()
     document_worker.start()
     try:
         yield
@@ -69,6 +71,15 @@ async def verify(
     if challenge is None or challenge_store.is_expired(challenge_id):
         raise HTTPException(status_code=400, detail="invalid or expired challenge_id")
 
+    # VERIFIED and REJECTED are terminal, so re-verifying a settled user has no
+    # legal state to move to. Refused here, before any layer runs, so a request
+    # that cannot be honoured does not pay for model inference first.
+    if state_store.is_settled(user_ref):
+        raise HTTPException(
+            status_code=409,
+            detail=f"user '{user_ref}' is already settled as {state_store.get(user_ref).value}",
+        )
+
     # Consumed rather than rejected outright so a replayed challenge reaches
     # the liveness layer as a risk signal, alongside whatever else that attempt
     # looks like, instead of collapsing into an opaque 4xx.
@@ -85,7 +96,12 @@ async def verify(
         metadata={"challenge_first_use": challenge_first_use, "frame_binding": frame_binding},
     )
 
-    response = await orchestrator.run_sync_tier(verification_input)
+    try:
+        response = await orchestrator.run_sync_tier(verification_input)
+    except IllegalStateTransition as exc:
+        # Reachable if the user settled concurrently between the check above
+        # and the transition; must surface as a conflict, not a 500.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     if id_photo_bytes is not None:
         # Queued, not awaited: the document tier runs out of band so the user

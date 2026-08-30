@@ -5,7 +5,7 @@ onboarding/login flow. It runs several verification layers concurrently,
 aggregates them into one risk decision, and settles full verification later via
 an asynchronous document-review tier.
 
-- **Sync tier** — answers inline, while the login flow waits
+- **Sync tier** — answers inline, ~46 ms warm on an M4 (see Latency)
 - **Async tier** — settles out of band, after the flow has ended
 - **Two integration points** — a flat JSON risk decision inline; a user-attribute
   write out of band
@@ -254,6 +254,51 @@ Exercise the whole flow against a running server:
 
 ---
 
+## Latency
+
+The sync tier is what the login flow waits on, so it is measured rather than
+assumed. Every response carries `total_duration_ms`, and each entry in `layers`
+carries its own `duration_ms`.
+
+Measured on an Apple M4 Pro, CPU, both model-backed layers enabled and warm
+(`pytest -m slow tests/test_latency_real.py`):
+
+| Layer | Time |
+|---|---|
+| `deepfake` (ViT, 224×224) | 44.1 ms |
+| `face_match` (MTCNN + InceptionResnetV1) | 22.2 ms |
+| `liveness` | 1.8 ms |
+| `injection` | 1.8 ms |
+| **Total** | **46.1 ms** |
+
+Serial execution would be 70.0 ms, so concurrency is doing real work: the total
+tracks the slowest layer, not the sum.
+
+**Read these as a floor, not a promise:**
+
+- **Synthetic inputs.** MTCNN finds no face in a noise image and short-circuits,
+  so `face_match` on a real capture will cost more than 22 ms.
+- **Warm.** The first call after startup pays model loading and a cold inference
+  — that first deepfake call measured ~600 ms. Load models at startup, not on
+  the first request.
+- **CPU only.** No MPS or GPU acceleration.
+
+Both budgets are configurable (`LatencySettings`): a soft `budget_ms` (5 s
+default) that logs a warning, and a `hard_ceiling_ms` (20 s) matching the
+calling flow engine's limit, which logs an error — past that the flow has
+already failed, so it is not merely slow.
+
+Every request logs its breakdown:
+
+```
+app.orchestrator: sync tier 46ms (slowest layer 44ms, serial would be 70ms):
+face_match=22ms, liveness=2ms, deepfake=44ms, injection=2ms
+```
+
+Set `TRUSTGATE_LOG_LEVEL` to change verbosity (default `INFO`). Only this
+project's loggers are configured, so raising it does not drown the output in
+torch/httpx noise.
+
 ## API reference
 
 | Endpoint | Purpose |
@@ -435,8 +480,9 @@ map onto a simple field path with no nesting to traverse:
   "decision": "ALLOW",
   "risk_score": 0.28,
   "reasons": ["injection: risk=0.56"],
-  "layers": ["...per-layer detail..."],
-  "document_job_id": "88632a8e-4dbe-49c4-9895-5efbd5b4fa19"
+  "layers": ["...per-layer detail, each with duration_ms..."],
+  "document_job_id": "88632a8e-4dbe-49c4-9895-5efbd5b4fa19",
+  "total_duration_ms": 46.1
 }
 ```
 

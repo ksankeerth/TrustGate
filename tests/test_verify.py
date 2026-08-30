@@ -109,3 +109,22 @@ def test_reusing_a_challenge_raises_the_liveness_risk():
 
     assert liveness_risk(second) > liveness_risk(first)
     assert liveness_risk(second) == 1.0
+
+
+@pytest.mark.parametrize("settled", [VerificationState.VERIFIED, VerificationState.REJECTED])
+def test_reverifying_a_settled_user_is_409_not_a_crash(settled):
+    """VERIFIED and REJECTED are terminal, so /verify has no legal state to move
+    to. That must surface as a conflict rather than an unhandled exception.
+    """
+    from app.main import state_store
+
+    user_ref = f"user-{uuid.uuid4()}"
+    if settled is VerificationState.VERIFIED:
+        state_store.transition(user_ref, VerificationState.PROVISIONAL)
+    state_store.transition(user_ref, settled)
+
+    challenge = client.post("/challenge").json()
+    response = _post_verify(challenge["challenge_id"], user_ref=user_ref)
+
+    assert response.status_code == 409
+    assert settled.value in response.json()["detail"]
