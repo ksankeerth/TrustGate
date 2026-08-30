@@ -18,6 +18,13 @@ class Decision(str, Enum):
     DENY = "DENY"
 
 
+class DocumentJobStatus(str, Enum):
+    PENDING = "PENDING"  # queued, automated checks not yet run
+    AWAITING_REVIEW = "AWAITING_REVIEW"  # automated checks done, needs a human decision
+    REJECTED = "REJECTED"  # settled: failed automated checks, or a reviewer denied it
+    VERIFIED = "VERIFIED"  # settled: a reviewer approved it
+
+
 class LayerResult(BaseModel):
     layer: str
     risk: float = Field(ge=0.0, le=1.0, description="0=no risk, 1=max risk")

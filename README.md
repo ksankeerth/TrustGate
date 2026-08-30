@@ -155,6 +155,75 @@ risk (0.3)**.
   `baseline_risk` 0.3, absence of evidence is not evidence of absence.
 - **No certification is claimed.**
 
+## Asynchronous document review
+
+The document tier runs **out of band**, after the sync tier has already
+answered and the login flow has ended. That is what lets a user hold
+provisional access while their document is still being checked. An in-process
+worker picks jobs off a queue at startup; nothing in the request path waits
+for it.
+
+```
+POST /verify (with id_photo)  ->  job queued, response returns immediately
+                                          |
+                              worker runs automated checks
+                                          |
+              +---------------------------+---------------------------+
+              |                                                       |
+   MRZ check digits fail                                 MRZ valid, or no MRZ
+   or MRZ unparseable                                              |
+              |                                                     |
+      auto-REJECTED                                       AWAITING_REVIEW
+   (user state -> REJECTED,                          (a human settles it via
+    no reviewer needed)                               POST /review/{job_id})
+```
+
+Poll `GET /document/{job_id}` for a job's status, findings and extracted MRZ
+fields.
+
+### The MRZ check digit is the one deterministic signal here
+
+Everything else in this service is a score with a threshold. MRZ check digits
+are not: they are defined by ICAO Doc 9303 and either verify or they do not.
+The parser handles TD1 (3x30), TD2 (2x36) and TD3 (2x44), and is validated in
+the test suite against the official specimen published in Doc 9303 Part 4 --
+so it is checked against the standard, not merely against itself.
+
+**What a valid MRZ proves:** the document's own fields agree with their check
+digits, i.e. the transcription is internally consistent.
+
+**What it does not prove:**
+
+- **Not authenticity.** Check digits are a transcription-integrity mechanism,
+  not an anti-forgery one. Anyone fabricating a document computes valid check
+  digits as a matter of course. This is precisely why a passing MRZ escalates
+  to human review rather than approving anything -- only a reviewer settles
+  `VERIFIED`.
+- **Not that tampering will be caught.** Modulo-10 check digits are blind to
+  any alteration whose weighted contribution shifts by a multiple of 10 --
+  roughly one random alteration in ten passes silently. There is a worked
+  example on the ICAO specimen in `tests/test_mrz.py`
+  (`test_check_digits_miss_alterations_whose_weighted_delta_is_a_multiple_of_ten`),
+  kept as a test so the property is not later mistaken for a bug.
+
+A **failing** check digit, by contrast, is unambiguous, so the worker rejects
+the job outright and settles the user's state without spending reviewer time.
+
+### OCR
+
+MRZ text can be supplied directly via the optional `mrz_text` form field on
+`/verify` and `/verify/document/async`. The worker will otherwise try to OCR it
+from the image, but **no OCR backend is installed by default** -- tesseract is
+a system package, not a pip dependency, so the service does not assume it. With
+no MRZ text and no OCR, the job reports that nothing could be checked
+automatically and escalates to a human; absence of a check is never reported as
+a passing check. To enable OCR:
+
+```bash
+brew install tesseract      # or your platform's equivalent
+pip install pytesseract
+```
+
 ## Quickstart
 
 ```bash
@@ -188,10 +257,14 @@ specific user identifier (otherwise one is generated per run).
 | Endpoint | Purpose |
 |---|---|
 | `POST /challenge` | Issues `{challenge_id, prompt_sequence, nonce, expires_at}` for the liveness anti-replay handshake. |
-| `POST /verify` | Runs the sync tier (concurrently) on a selfie + optional ID photo + optional liveness frames; returns a flat `VerifyResponse`. Enqueues an async document-review job when `id_photo` is present. |
-| `POST /verify/document/async` | Enqueues a document-review job directly (outside the sync flow); returns `{job_id}`. |
+| `POST /verify` | Runs the sync tier (concurrently) on a selfie + optional ID photo + optional liveness frames; returns a flat `VerifyResponse`. Queues an async document-review job when `id_photo` is present. |
+| `POST /verify/document/async` | Queues a document-review job directly (outside the sync flow); returns `{job_id}`. |
+| `GET /document/{job_id}` | Document job status, findings and extracted MRZ fields. |
 | `GET /status/{user_ref}` | Returns the user's current verification state. |
 | `POST /review/{job_id}` | Human-in-the-loop settle: `{decision, reviewer_note}` -> transitions `PROVISIONAL` to `VERIFIED` (ALLOW) or `REJECTED` (DENY). |
+
+`/verify` form fields: `challenge_id`, `user_ref`, `selfie` (required);
+`id_photo`, `liveness_frames[]`, `frame_binding`, `mrz_text` (optional).
 
 ### Verification state machine
 
@@ -203,6 +276,12 @@ UNVERIFIED --(sync tier fails)---------------------------------------> REJECTED
 
 `VERIFIED` and `REJECTED` are terminal. `PROVISIONAL -> PROVISIONAL` is
 allowed (idempotent) so a retried `/verify` call doesn't fail.
+
+### Document job status
+
+`PENDING` -> `AWAITING_REVIEW` -> `VERIFIED` | `REJECTED`, or straight to
+`REJECTED` when automated checks fail. A settled job cannot be reviewed again
+(`409`).
 
 ## Integration contract (adaptive-auth product)
 

@@ -57,12 +57,19 @@ print(f"frame_binding={binding}")
 PY
 FRAME_BINDING=$(cat "$FRAMES_DIR/binding.txt")
 
+# The specimen MRZ published in ICAO Doc 9303 Part 4. Its check digits are
+# valid, so the document worker escalates to human review rather than
+# auto-rejecting. Corrupt any character to watch it auto-reject instead.
+MRZ='P<UTOERIKSSON<<ANNA<MARIA<<<<<<<<<<<<<<<<<<<
+L898902C36UTO7408122F1204159ZE184226B<<<<<10'
+
 echo
-echo "== 3) POST /verify (selfie + id_photo + bound liveness frames) =="
+echo "== 3) POST /verify (selfie + id_photo + bound frames + MRZ) =="
 VERIFY_JSON=$(curl -sf -X POST "$BASE_URL/verify" \
   -F "challenge_id=$CHALLENGE_ID" \
   -F "user_ref=$USER_REF" \
   -F "frame_binding=$FRAME_BINDING" \
+  -F "mrz_text=$MRZ" \
   -F "selfie=@$FRAMES_DIR/selfie.jpg" \
   -F "id_photo=@$FRAMES_DIR/id_photo.jpg" \
   -F "liveness_frames=@$FRAMES_DIR/frame_0.jpg" \
@@ -88,13 +95,19 @@ fi
 DOCUMENT_JOB_ID=$(echo "$VERIFY_JSON" | json_field document_job_id)
 
 echo
-echo "== 5) POST /review/$DOCUMENT_JOB_ID (reviewer approves) =="
+echo "== 5) GET /document/$DOCUMENT_JOB_ID (async worker result) =="
+sleep 1
+curl -sf "$BASE_URL/document/$DOCUMENT_JOB_ID"
+echo
+
+echo
+echo "== 6) POST /review/$DOCUMENT_JOB_ID (reviewer approves) =="
 curl -sf -X POST "$BASE_URL/review/$DOCUMENT_JOB_ID" \
   -H "Content-Type: application/json" \
   -d '{"decision":"ALLOW","reviewer_note":"document looks genuine"}'
 echo
 
 echo
-echo "== 6) GET /status/$USER_REF (after review) =="
+echo "== 7) GET /status/$USER_REF (after review) =="
 curl -sf "$BASE_URL/status/$USER_REF"
 echo
