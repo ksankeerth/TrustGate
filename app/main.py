@@ -14,6 +14,7 @@ from app.core.contracts import (
     VerifyResponse,
 )
 from app.document_worker import DocumentReviewWorker
+from app.integrations.thunderid_client import build_thunderid_client
 from app.layers.base import VerificationInput
 from app.orchestrator import Orchestrator
 from app.state.challenge_store import ChallengeStore
@@ -24,7 +25,8 @@ challenge_store = ChallengeStore(ttl_seconds=default_challenge_settings.ttl_seco
 document_job_store = DocumentJobStore()
 state_store = VerificationStateStore()
 orchestrator = Orchestrator(state_store)
-document_worker = DocumentReviewWorker(document_job_store, state_store)
+thunderid_client = build_thunderid_client()
+document_worker = DocumentReviewWorker(document_job_store, state_store, thunderid_client)
 
 
 @asynccontextmanager
@@ -126,7 +128,7 @@ def get_status(user_ref: str) -> StatusResponse:
 
 
 @app.post("/review/{job_id}", response_model=StatusResponse)
-def review(job_id: str, body: ReviewRequest) -> StatusResponse:
+async def review(job_id: str, body: ReviewRequest) -> StatusResponse:
     job = document_job_store.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="document job not found")
@@ -145,5 +147,11 @@ def review(job_id: str, body: ReviewRequest) -> StatusResponse:
 
     job_status = DocumentJobStatus.VERIFIED if body.decision == Decision.ALLOW else DocumentJobStatus.REJECTED
     document_job_store.settle(job_id, status=job_status, reviewer_note=body.reviewer_note)
+
+    # Out-of-band propagation: no login flow is running by now, so this is how
+    # the identity product learns the review outcome. Deliberately not fatal --
+    # the local store is the system of record, and the review has already been
+    # recorded, so an unreachable ThunderID must not fail the reviewer's action.
+    await thunderid_client.update_verification_status(job.user_ref, state)
 
     return StatusResponse(user_ref=job.user_ref, state=state)

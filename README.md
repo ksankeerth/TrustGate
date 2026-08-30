@@ -1,228 +1,277 @@
 # TrustGate
 
-An external identity-verification service (Python / FastAPI) built for an
-adaptive-auth product's onboarding/login flow. It runs several verification
-layers, aggregates them into a single risk decision, and exposes an
-asynchronous document-review tier that settles full verification later.
+External identity-verification service (Python / FastAPI) for an adaptive-auth
+onboarding/login flow. It runs several verification layers concurrently,
+aggregates them into one risk decision, and settles full verification later via
+an asynchronous document-review tier.
 
-## Current status
+- **Sync tier** — answers inline, while the login flow waits
+- **Async tier** — settles out of band, after the flow has ended
+- **Two integration points** — a flat JSON risk decision inline; a user-attribute
+  write out of band
 
-The full **challenge → verify → status → review** flow works end to end, and
-all four sync-tier layers are now implemented:
+---
 
-| Layer | Status | Default |
-|---|---|---|
-| Face match | Real (MTCNN + InceptionResnetV1) | Off -- mock stub runs instead |
-| Deepfake | Real (SigLIP2 / ViT classifier) | Off -- mock stub runs instead |
-| Liveness | Real, **demonstrator** | On |
-| Injection | Real, **demonstrator** | On |
+## Architecture at a glance
 
-The two model-backed layers are off by default so the test suite and app
-startup stay fast and download-free; enable them explicitly (see below). The
-two demonstrator layers need no model and run by default, but are deliberately
-weak -- see their limitations sections. Every layer result carries a
-`demonstrator` flag so callers can tell weak or mock layers from
-production-grade ones, and the aggregator down-weights both.
+```text
+   CLIENT                IDENTITY PRODUCT            TRUSTGATE
+   (app / browser)       (ThunderID :8090)           (FastAPI :8000)
+        |                       |                          |
+   1    |--- start login ------>|                          |
+        |                       |                          |
+   2    |--- GET /challenge ---------------------------->  |
+        |  <---------------- nonce + prompt sequence ----  |
+        |                       |                          |
+   3    |  capture selfie / ID / frames, bind to nonce     |
+        |                       |                          |
+   4    |--- submit ----------> |--- POST /verify ------>  |
+        |                       |                          |
+        |                       |                     sync tier
+        |                       |                     4 layers
+        |                       |                          |
+        |                       |  <-- decision, risk ---  |
+   5    |  <-- ALLOW / STEP_UP / DENY --                   |
+        |                       |                          |
+        |                       |                   queue doc job
+        |                       |                          |
+        =========  login flow ENDS, user is PROVISIONAL  =========
+        |                       |                          |
+        |                       |                     async tier
+        |                       |                    MRZ + human
+        |                       |                          |
+   6    |                       |  <-- PUT /users/{id} --  |
+        |                       |      verification_status |
+        |                       |                          |
+   7    |  <-- full access ---- |                          |
+```
 
-**Deepfake detection is real**, but disabled by default (`DeepfakeSettings.enabled
-= False` in `app/core/config.py`) so the default test suite and app startup stay
-fast and network-free. It supports two interchangeable open-source checkpoints
-(both Apache-2.0, ungated):
+**The key idea:** step 5 ends the flow. Steps 6–7 happen with *no flow running* —
+which is exactly what makes a slow, human-in-the-loop document check possible
+without holding a login open.
+
+---
+
+## Sync tier pipeline
+
+```text
+  POST /verify
+    |
+    |   challenge_id . user_ref . selfie . id_photo
+    |   liveness_frames[] . frame_binding . mrz_text
+    |
+    v
+  +=== FAN OUT: all four layers run concurrently (asyncio.gather) ========+
+  |                                                                       |
+  |   face_match                                    in: selfie + id_photo |
+  |      MTCNN --crop/align--> InceptionResnetV1 (vggface2)               |
+  |            --> two 512-d embeddings --> cosine similarity             |
+  |      out:  risk anchored so similarity == threshold  ->  0.50         |
+  |            confidence = MTCNN face-detection probability              |
+  |                                                                       |
+  |   deepfake                                              in: selfie    |
+  |      SigLIP2  OR  ViT   (load-either, identical interface)            |
+  |            --> fake_probability                                       |
+  |      out:  risk = fake_probability, confidence = max softmax          |
+  |                                                                       |
+  |   liveness                          in: frames + challenge  [DEMO]    |
+  |      challenge fresh?  single-use?  HMAC frame-binding valid?         |
+  |      inter-frame pixel delta above the static-image floor?            |
+  |      out:  risk = worst finding, floored at 0.20; confidence 0.35     |
+  |                                                                       |
+  |   injection                         in: selfie + frames     [DEMO]    |
+  |      EXIF provenance . frame uniformity . sensor-noise floor          |
+  |      out:  risk = worst finding, floored at 0.30; confidence 0.20     |
+  |                                                                       |
+  +=== FAN IN: total latency = slowest layer, NOT the sum ================+
+    |
+    |   four LayerResults: { risk, confidence, ok, reason, demonstrator }
+    v
+  AGGREGATOR
+    |
+    |   weighted mean of the four risks; each layer's weight is
+    |
+    |         layer_weight  x  confidence  x  (0.5 if demonstrator)
+    |
+    |   so an unsure or deliberately weak layer moves the score less
+    |   than a confident production-grade one
+    v
+  risk_score
+
+    0.0 ------------- 0.30 ------------- 0.70 ------------- 1.0
+     |    ALLOW        |    STEP_UP       |     DENY         |
+     |                 |                  |                  |
+     |  continue flow  |  OTP / passkey   |  fail path       |
+     |                 |                  |                  |
+     |   PROVISIONAL   |   PROVISIONAL    |   REJECTED       |
+```
+
+### Layers and models
+
+| Layer | Model / method | Real? | Default |
+|---|---|---|---|
+| `face_match` | MTCNN → InceptionResnetV1 (`vggface2`) → cosine similarity | Real | **Off** (mock stub) |
+| `deepfake` | SigLIP2 or ViT image classifier (load-either) | Real | **Off** (mock stub) |
+| `liveness` | Challenge binding + inter-frame delta heuristics | Demonstrator | **On** |
+| `injection` | EXIF provenance + sensor-noise heuristics | Demonstrator | **On** |
+
+Model-backed layers are off by default so tests and startup stay fast and
+network-free. Every result carries a `demonstrator` flag, and the aggregator
+down-weights those layers.
+
+**Checkpoints** (both Apache-2.0, ungated, cached to `.cache/huggingface/`):
 
 | `model_choice` | Checkpoint | Base |
 |---|---|---|
 | `vit` (default) | `prithivMLmods/Deep-Fake-Detector-v2-Model` | `google/vit-base-patch16-224-in21k` |
 | `siglip2` | `prithivMLmods/Deepfake-Detect-Siglip2` | `google/siglip2-base-patch16-224` |
 
-Each checkpoint's native label order is normalized inside the layer to a
-canonical `fake_probability` -> `risk`, so the aggregator never needs to know
-which checkpoint is active. Model weights cache to `.cache/huggingface/`
-(project-local, gitignored) rather than the default `~/.cache/huggingface`.
+Each checkpoint's native label order is normalised inside the layer into a
+canonical `fake_probability`, so the aggregator never needs to know which is
+active.
 
-To enable it, set `DeepfakeSettings.enabled = True` (and optionally
-`model_choice`, `device`) before the app builds its default layer list.
-**As with any deepfake classifier, treat its output as a risk signal, not a
-verdict** -- it does not generalize to unseen generators.
+---
 
-Its dedicated test (`tests/test_deepfake_real.py`, marked `slow`, excluded
-from the default `pytest` run) needs two local images it does not ship with
-the repo -- `samples/deepfake_eval/known_real.jpg` and `known_fake.jpg`
-(gitignored) -- since real face photos and deepfake samples shouldn't be
-committed to a public repo. Add your own to run it: `pytest -m slow`.
+## Async tier pipeline
 
-**Face match is also real**, same pattern: disabled by default
-(`FaceMatchSettings.enabled = False`). It uses MTCNN (face
-detection/crop/alignment) and `InceptionResnetV1` (pretrained on `vggface2`
-by default, or `casia-webface`) for embeddings, and cosine similarity
-between the selfie and ID-photo embeddings maps to risk (low similarity =
-high risk, threshold configurable). Weights cache to `.cache/torch/`
-(project-local, via `TORCH_HOME`). If no face is detected in either image,
-the layer reports maximum risk rather than erroring.
+```text
+   POST /verify (id_photo)        POST /verify/document/async
+              |                              |
+              '--------------.---------------'
+                             |
+                  job queued, response returns at once
+                             |
+                    in-process worker (asyncio queue)
+                             |
+                      mrz_text supplied?
+                             |
+            .----------------'----------------.
+           yes                                no
+            |                                 |
+        MRZ parse                     tesseract installed?
+     ICAO Doc 9303                            |
+    TD1 / TD2 / TD3                  .--------'--------.
+            |                       yes                no
+    check digits valid?              |                 |
+            |                    OCR image      nothing to check
+      .-----'-----.                  |                 |
+     no          yes                 |                 |
+      |           |                  |                 |
+      |           '------------------'-----------------'
+      |                              |
+  AUTO-REJECT                 AWAITING_REVIEW
+  deterministic          human settles via POST /review
+  no reviewer time                    |
+      |                     .---------'---------.
+      |                   ALLOW               DENY
+      |                     |                   |
+      v                     v                   v
+  REJECTED              VERIFIED            REJECTED
+      |                     |                   |
+      '---------------------'-------------------'
+                            |
+              PUT /users/{id}  verification_status
+                            |
+                        ThunderID
+```
 
-Its dedicated test (`tests/test_face_match_real.py`, also `slow`) needs three
-local images -- `samples/face_match_eval/same_person_a.jpg`, `same_person_b.jpg`,
-and `different_person.jpg` (gitignored) -- for the same reason as above.
+Poll `GET /document/{job_id}` for status, findings and extracted MRZ fields.
 
-The MTCNN/InceptionResnetV1 code itself is vendored from `facenet-pytorch`
-(MIT licensed) into `app/layers/_vendor/facenet_pytorch/` rather than taken
-as an ordinary dependency -- its latest PyPI release pins `torch<2.3.0` /
-`numpy<2.0.0` / `Pillow<10.3.0`, versions with no prebuilt wheels for recent
-Python, which would force a broken from-source build (or downgrade the
-torch/numpy the deepfake layer needs) if installed normally. See
-`app/layers/_vendor/facenet_pytorch/README.md` for the details and exactly
-what was changed from upstream (nothing behavioral).
+---
 
-## Liveness: a demonstrator, and its limitations
+## Deployment (PoC)
 
-The liveness layer needs no model download, so unlike the two above it runs
-by default. It is deliberately **weak by design and self-reporting**: every
-result it emits carries `demonstrator: true` and a `reason` that spells out
-what it did and did not establish. Read its output as "nothing obviously
-wrong", never as "a live human was present".
+`./deployment/start-all.sh` runs both services on one machine, so TrustGate is
+developed against the real identity product rather than a mock.
 
-**What it actually checks** (all genuinely enforced server-side):
+```text
+  ONE MACHINE (macOS / Linux)
 
-| Check | Catches |
-|---|---|
-| Challenge exists and is unexpired | Attempts not tied to a fresh, server-issued challenge |
-| Challenge is single-use | Re-presenting an earlier attempt's `challenge_id` |
-| Frame binding (optional HMAC) | Wholesale replay of a previously captured payload |
-| Frame count | Payloads too thin to assess at all |
-| Inter-frame variation | One still image submitted as if it were a capture |
+  +---------------------------+          +----------------------------+
+  |  ThunderID  v1.0.1        |          |  TrustGate                 |
+  |  Go binary + SQLite       |          |  uvicorn / FastAPI         |
+  |  HTTPS :8090 self-signed  |          |  HTTP  :8000               |
+  |                           |          |                            |
+  |  /console       admin UI  |          |  /challenge   /verify      |
+  |  /oauth2/token  OAuth2    |          |  /document    /review      |
+  |  /users         mgmt API  |          |  /status      /health      |
+  |  /health/liveness         |          |                            |
+  +---------------------------+          +----------------------------+
 
-**Frame binding** is an HMAC the client computes over its frames keyed by the
-challenge nonce (`compute_frame_binding` in `app/layers/liveness.py`), sent as
-the optional `frame_binding` form field on `/verify`. It proves the payload
-was assembled by something holding *this* challenge's nonce. It does **not**
-prove the frames were captured live: the nonce goes to the client in the
-clear, so anyone who can request a challenge can compute a valid binding over
-pre-recorded footage. Omitting the field is scored as a real gap, not ignored.
+  How TrustGate talks to ThunderID when a verification settles:
 
-**What it does NOT do — the honest part:**
+     TrustGate                                          ThunderID
+         |                                                   |
+    1    |  POST /oauth2/token                               |
+         |  Basic(client_id, client_secret)                  |
+         |  grant_type=client_credentials                    |
+         |  scope=system   resource=<base>/mcp               |
+         |-------------------------------------------------->|
+         |<--------------------------------------------------|
+         |  access_token   scope: system   (cached)          |
+         |                                                   |
+    2    |  GET /users?filter=username eq "<user_ref>"       |
+         |-------------------------------------------------->|
+         |<--------------------------------------------------|
+         |  { id, ouId, type, attributes }   <- need all     |
+         |                                                   |
+    3    |  PUT /users/{id}       full replace, not a patch   |
+         |  { ouId, type, attributes: { ..., status } }      |
+         |-------------------------------------------------->|
+         |<--------------------------------------------------|
+         |  200 + stored attributes                          |
+         |                                                   |
+    4    |  read back and compare                            |
+         |  a 200 does NOT mean it was stored -- an          |
+         |  unregistered attribute is dropped silently       |
+         |                                                   |
+```
 
-- **It does not verify the prompted actions were performed.** The challenge
-  asks for e.g. "blink, nod, open_mouth", and nothing checks that any of that
-  happened. Doing so needs real action recognition, which is out of scope here.
-- **It is not a certified presentation-attack detection control.** No iBeta or
-  equivalent testing has been done, and none is claimed.
-- **Its motion check is crude.** A mean per-pixel delta between consecutive
-  frames distinguishes a repeated still from *something* changing; it cannot
-  distinguish a live face from a video of a face, a mask, or a screen replay.
-- **A clean pass never scores zero risk.** Passing every check still returns
-  `baseline_risk` (0.2 by default), because a clean run from this layer is
-  weak evidence. Its `confidence` is likewise capped low (0.35), which the
-  aggregator uses to down-weight it against real layers.
-- **Defeating an attacker who holds a valid nonce is out of its reach.** That
-  is nominally the injection layer's territory -- and, as the next section
-  explains, largely beyond its reach too.
+```text
+  deployment/
+    dist/                          ThunderID distribution  (gitignored ~115MB)
+    run/                           logs + pid files        (gitignored)
+    resources/trustgate-app.yaml   applied at ThunderID startup
+    provision_thunderid.py         run once ThunderID is up
+```
 
-## Injection detection: the weakest layer here
+### Startup sequence
 
-**Injection** means bypassing the camera altogether -- a virtual camera,
-emulator, or feeding frames straight to the API -- as distinct from a
-*presentation* attack held up to a real lens. It also runs by default and needs
-no model.
+```text
+  fetch-thunderid.sh          detect OS/arch -> download release -> unpack
+          |
+  start-all.sh
+          |
+          +-- (first run only) ThunderID setup.sh
+          |       generates config/certs/, seeds resources, creates admin
+          |       WITHOUT THIS: start.sh fails on missing crypto.key
+          |
+          +-- ThunderID start.sh <resources/trustgate-app.yaml>
+          |       registers TrustGate m2m app + role granting `system`
+          |       poll https://localhost:8090/health/liveness
+          |
+          +-- provision_thunderid.py
+          |       adds verification_status to the Person user-type schema
+          |       WITHOUT THIS: attribute writes return 200 and store nothing
+          |
+          +-- TrustGate uvicorn
+                  poll http://127.0.0.1:8000/health
+```
 
-Be clear-eyed about this one: **detecting injection from uploaded stills is
-close to a lost cause.** Every signal available server-side is either trivially
-forgeable or routinely absent on genuine traffic. Production systems address
-injection with **client attestation** (Play Integrity, App Attest, hardware-backed
-key attestation) proving the frames came from a real camera on an untampered
-device. This service receives an HTTP upload and cannot attest anything about
-its origin. What follows is a best-effort demonstrator, scored to be leaned on
-least: the **lowest confidence of any layer (0.2)** and the **highest baseline
-risk (0.3)**.
+Both services are launched detached (`nohup`, own process group), so they
+outlive the launching shell and can be stopped independently.
 
-**What it looks at:**
+### Provisioning: two mechanisms, and why
 
-| Signal | Rationale | Why it's weak |
+| What | How | Why not the other way |
 |---|---|---|
-| EXIF `Software` tag vs. known encoder/virtual-camera markers | Injection tooling often leaves a trace | Trivially stripped or spoofed |
-| Missing camera make/model | Synthetic frames often carry no camera metadata | Many legitimate clients strip EXIF for privacy |
-| Missing capture timestamp | Incomplete provenance | Same as above |
-| Identical frame byte lengths | Independently encoded camera frames rarely match exactly | Easy to vary deliberately |
-| Sensor-noise floor | Real sensors are never perfectly smooth; renders often are | A photo of a blank wall scores low; noise is easy to add |
-| Frame dimension disagreement | One capture session should be internally consistent | Easy to normalise |
+| TrustGate app + role | Declarative YAML passed to `start.sh` | Creating it via API needs a token, which needs the app — circular |
+| `verification_status` on the schema | `provision_thunderid.py` (authenticated) | Cannot be expressed in the startup resources file |
 
-**What it does NOT do:**
+See [deployment/README.md](deployment/README.md) for the full API contract and
+four non-obvious behaviours that will otherwise bite.
 
-- **It cannot establish that frames came from a real camera.** Only attestation
-  can, and that is a client-side capability this service does not have.
-- **Expect modest accuracy in both directions.** A privacy-conscious client that
-  strips EXIF looks suspicious; a careful attacker who forges plausible metadata
-  and adds noise looks clean. Do not tune a hard gate on this layer's output.
-- **A clean pass never scores zero risk**, for the same reason as liveness: at
-  `baseline_risk` 0.3, absence of evidence is not evidence of absence.
-- **No certification is claimed.**
-
-## Asynchronous document review
-
-The document tier runs **out of band**, after the sync tier has already
-answered and the login flow has ended. That is what lets a user hold
-provisional access while their document is still being checked. An in-process
-worker picks jobs off a queue at startup; nothing in the request path waits
-for it.
-
-```
-POST /verify (with id_photo)  ->  job queued, response returns immediately
-                                          |
-                              worker runs automated checks
-                                          |
-              +---------------------------+---------------------------+
-              |                                                       |
-   MRZ check digits fail                                 MRZ valid, or no MRZ
-   or MRZ unparseable                                              |
-              |                                                     |
-      auto-REJECTED                                       AWAITING_REVIEW
-   (user state -> REJECTED,                          (a human settles it via
-    no reviewer needed)                               POST /review/{job_id})
-```
-
-Poll `GET /document/{job_id}` for a job's status, findings and extracted MRZ
-fields.
-
-### The MRZ check digit is the one deterministic signal here
-
-Everything else in this service is a score with a threshold. MRZ check digits
-are not: they are defined by ICAO Doc 9303 and either verify or they do not.
-The parser handles TD1 (3x30), TD2 (2x36) and TD3 (2x44), and is validated in
-the test suite against the official specimen published in Doc 9303 Part 4 --
-so it is checked against the standard, not merely against itself.
-
-**What a valid MRZ proves:** the document's own fields agree with their check
-digits, i.e. the transcription is internally consistent.
-
-**What it does not prove:**
-
-- **Not authenticity.** Check digits are a transcription-integrity mechanism,
-  not an anti-forgery one. Anyone fabricating a document computes valid check
-  digits as a matter of course. This is precisely why a passing MRZ escalates
-  to human review rather than approving anything -- only a reviewer settles
-  `VERIFIED`.
-- **Not that tampering will be caught.** Modulo-10 check digits are blind to
-  any alteration whose weighted contribution shifts by a multiple of 10 --
-  roughly one random alteration in ten passes silently. There is a worked
-  example on the ICAO specimen in `tests/test_mrz.py`
-  (`test_check_digits_miss_alterations_whose_weighted_delta_is_a_multiple_of_ten`),
-  kept as a test so the property is not later mistaken for a bug.
-
-A **failing** check digit, by contrast, is unambiguous, so the worker rejects
-the job outright and settles the user's state without spending reviewer time.
-
-### OCR
-
-MRZ text can be supplied directly via the optional `mrz_text` form field on
-`/verify` and `/verify/document/async`. The worker will otherwise try to OCR it
-from the image, but **no OCR backend is installed by default** -- tesseract is
-a system package, not a pip dependency, so the service does not assume it. With
-no MRZ text and no OCR, the job reports that nothing could be checked
-automatically and escalates to a human; absence of a check is never reported as
-a passing check. To enable OCR:
-
-```bash
-brew install tesseract      # or your platform's equivalent
-pip install pytesseract
-```
+---
 
 ## Quickstart
 
@@ -231,69 +280,193 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
+# TrustGate alone
 uvicorn app.main:app --reload
+curl http://127.0.0.1:8000/health          # {"status":"ok"}
+
+# TrustGate + ThunderID together
+./deployment/fetch-thunderid.sh            # one-time, ~34MB
+./deployment/start-all.sh
+./deployment/stop-all.sh
 ```
 
-Health check:
+Optional — enables MRZ OCR (otherwise pass `mrz_text` yourself):
 
 ```bash
-curl http://127.0.0.1:8000/health
-# {"status":"ok"}
+brew install tesseract && pip install pytesseract
 ```
 
-## Demo script
-
-Exercises the full flow against a running server:
+Exercise the whole flow against a running server:
 
 ```bash
-./scripts/demo.sh
+./scripts/demo.sh          # BASE_URL and USER_REF are overridable
 ```
 
-Set `BASE_URL` to point at a non-default host/port, and `USER_REF` to pin a
-specific user identifier (otherwise one is generated per run).
+---
 
 ## API reference
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /challenge` | Issues `{challenge_id, prompt_sequence, nonce, expires_at}` for the liveness anti-replay handshake. |
-| `POST /verify` | Runs the sync tier (concurrently) on a selfie + optional ID photo + optional liveness frames; returns a flat `VerifyResponse`. Queues an async document-review job when `id_photo` is present. |
-| `POST /verify/document/async` | Queues a document-review job directly (outside the sync flow); returns `{job_id}`. |
-| `GET /document/{job_id}` | Document job status, findings and extracted MRZ fields. |
-| `GET /status/{user_ref}` | Returns the user's current verification state. |
-| `POST /review/{job_id}` | Human-in-the-loop settle: `{decision, reviewer_note}` -> transitions `PROVISIONAL` to `VERIFIED` (ALLOW) or `REJECTED` (DENY). |
+| `POST /challenge` | Issue `{challenge_id, prompt_sequence, nonce, expires_at}` for the liveness handshake |
+| `POST /verify` | Run the sync tier; return flat `VerifyResponse`; queue a doc job if `id_photo` present |
+| `POST /verify/document/async` | Queue a doc job directly, outside the sync flow |
+| `GET /document/{job_id}` | Doc job status, findings, extracted MRZ fields |
+| `GET /status/{user_ref}` | Current verification state |
+| `POST /review/{job_id}` | Human settle: `{decision, reviewer_note}` |
 
-`/verify` form fields: `challenge_id`, `user_ref`, `selfie` (required);
-`id_photo`, `liveness_frames[]`, `frame_binding`, `mrz_text` (optional).
+`/verify` form fields:
+
+- **Required** — `challenge_id`, `user_ref`, `selfie`
+- **Optional** — `id_photo`, `liveness_frames[]`, `frame_binding`, `mrz_text`
 
 ### Verification state machine
 
-```
-UNVERIFIED --(sync tier passes)--> PROVISIONAL --(async review passes)--> VERIFIED
-UNVERIFIED --(sync tier fails)---------------------------------------> REJECTED
-                                   PROVISIONAL --(async review fails)-> REJECTED
+```text
+                    sync tier passes            async review passes
+   UNVERIFIED --------------------> PROVISIONAL -------------------> VERIFIED
+       |                                 |
+       | sync tier fails (DENY)          | async review fails
+       |                                 |
+       +------------> REJECTED <---------+
 ```
 
-`VERIFIED` and `REJECTED` are terminal. `PROVISIONAL -> PROVISIONAL` is
-allowed (idempotent) so a retried `/verify` call doesn't fail.
+- `VERIFIED` and `REJECTED` are **terminal**
+- `PROVISIONAL -> PROVISIONAL` is allowed, so a retried `/verify` does not fail
 
 ### Document job status
 
-`PENDING` -> `AWAITING_REVIEW` -> `VERIFIED` | `REJECTED`, or straight to
-`REJECTED` when automated checks fail. A settled job cannot be reviewed again
-(`409`).
+```text
+   PENDING --> AWAITING_REVIEW --> VERIFIED | REJECTED
+       |
+       +-------> REJECTED          (automated checks failed)
+```
 
-## Integration contract (adaptive-auth product)
+A settled job cannot be reviewed again (`409`).
 
-The service is designed to be called by an identity product's flow engine
-via two different integration points.
+---
 
-### 1. Inline (synchronous) -- generic HTTP-request executor
+## Layer detail and honest limitations
 
-A flow's HTTP-request step calls `POST /verify` and branches on the
-response. `decision` and `risk_score` are deliberately **top-level, flat
-JSON fields** so they map directly onto a simple field-path response
-mapping, with no need to reach into nested objects:
+Every layer self-reports. Read `demonstrator: true` as "this is deliberately
+weak", never as a production control.
+
+### Face match — real
+
+- **MTCNN** detects, crops and aligns each face; **InceptionResnetV1**
+  (`vggface2` by default, or `casia-webface`) embeds it
+- Cosine similarity → risk, anchored so `similarity == threshold` maps to
+  exactly `0.5` — a pair that fails the threshold can never score as ALLOW
+- Confidence is MTCNN's **detection probability**, not distance from the
+  threshold, so borderline comparisons keep full weight in the aggregator
+- No face detected in either image → maximum risk, not an error
+- Weights cache to `.cache/torch/` via `TORCH_HOME`
+- MTCNN/InceptionResnetV1 are **vendored** into
+  `app/layers/_vendor/facenet_pytorch/` (MIT) — the PyPI release pins
+  `torch<2.3.0` / `numpy<2.0.0` / `Pillow<10.3.0`, which will not build on
+  recent Python. See that directory's README for exactly what changed
+  (nothing behavioural)
+
+### Deepfake — real
+
+- Load-either SigLIP2 / ViT classifier; emits `fake_probability` → risk
+- **Treat as a risk signal, not a verdict** — it does not generalise to unseen
+  generators
+- Corrupt/undecodable input returns a graded result rather than a 500
+
+### Liveness — demonstrator
+
+**What it genuinely enforces, server-side:**
+
+| Check | Catches |
+|---|---|
+| Challenge exists, unexpired | Attempts not tied to a fresh server-issued challenge |
+| Challenge is single-use | Re-presenting an earlier attempt's `challenge_id` |
+| Frame binding (HMAC, optional) | Wholesale replay of a previously captured payload |
+| Frame count | Payloads too thin to assess |
+| Inter-frame pixel delta | One still image submitted as a capture |
+
+**Frame binding** = `HMAC(nonce, frames)`, sent as the optional `frame_binding`
+field. It proves the payload was assembled by something holding *this*
+challenge's nonce. It does **not** prove live capture — the nonce reaches the
+client in the clear, so anyone who can request a challenge can bind
+pre-recorded footage. Omitting it is scored as a real gap, not ignored.
+
+**What it does NOT do:**
+
+- **Does not verify the prompted actions happened.** The challenge asks for
+  "blink, nod, open_mouth" and nothing checks that any of it occurred — that
+  needs action recognition, out of scope here
+- **Not a certified PAD control.** No iBeta or equivalent testing; none claimed
+- **Motion check is crude.** Distinguishes a repeated still from *something*
+  changing; cannot distinguish a live face from a video, mask or screen replay
+- **A clean pass never scores zero** — floors at `baseline_risk` 0.2, with
+  `confidence` capped at 0.35
+
+### Injection — demonstrator, the weakest layer here
+
+**Injection** = bypassing the camera entirely (virtual camera, emulator, direct
+API feed), as distinct from a *presentation* attack held to a real lens.
+
+Be clear-eyed: **detecting this from uploaded stills is close to a lost cause.**
+Production systems solve it with **client attestation** (Play Integrity, App
+Attest), proving frames came from a real camera on an untampered device. This
+service receives an HTTP upload and can attest nothing about its origin.
+
+| Signal | Rationale | Why it's weak |
+|---|---|---|
+| EXIF `Software` vs. known markers | Tooling often leaves a trace | Trivially stripped or spoofed |
+| Missing camera make/model | Synthetic frames often carry none | Many clients strip EXIF for privacy |
+| Missing capture timestamp | Incomplete provenance | Same |
+| Identical frame byte lengths | Real frames rarely match exactly | Easy to vary |
+| Sensor-noise floor | Real sensors are never perfectly smooth | A photo of a blank wall scores low |
+| Frame dimension disagreement | One session should be consistent | Easy to normalise |
+
+- Scored to be leaned on least: **lowest confidence (0.2)**, **highest baseline
+  risk (0.3)**
+- Expect **false positives** on privacy-conscious clients and **false
+  negatives** on any attacker who forges metadata and adds noise
+- Do not tune a hard gate on this layer's output
+
+### MRZ check digits — the one deterministic signal
+
+Everything else here is a score with a threshold. MRZ check digits are not:
+ICAO Doc 9303 defines them, and they either verify or they do not.
+
+- Parses **TD1** (3×30), **TD2** (2×36), **TD3** (2×44)
+- Validated in the test suite against the **official specimen in Doc 9303
+  Part 4** — checked against the standard, not merely against itself
+
+**What a valid MRZ proves:** the fields agree with their check digits, i.e. the
+transcription is internally consistent.
+
+**What it does not prove:**
+
+- **Not authenticity.** Check digits are a transcription-integrity mechanism.
+  Anyone fabricating a document computes valid ones as a matter of course —
+  which is exactly why a passing MRZ *escalates to human review* rather than
+  approving anything
+- **Not that tampering is caught.** Modulo-10 check digits are blind to any
+  alteration whose weighted contribution shifts by a multiple of 10 — roughly
+  **one random alteration in ten passes silently**. Worked example on the ICAO
+  specimen in `tests/test_mrz.py`, kept as a test so it is not later mistaken
+  for a bug
+
+A **failing** check digit is unambiguous, so the worker rejects outright and
+settles state without spending reviewer time.
+
+**OCR** is optional and absent by default — tesseract is a system package, not a
+pip dependency. With no `mrz_text` and no OCR, the job reports that nothing
+could be checked and escalates; absence of a check is never reported as a pass.
+
+---
+
+## Integration contract
+
+### 1. Inline (synchronous) — HTTP-request executor
+
+`decision` and `risk_score` are deliberately **top-level, flat JSON**, so they
+map onto a simple field path with no nesting to traverse:
 
 ```json
 {
@@ -302,15 +475,12 @@ mapping, with no need to reach into nested objects:
   "decision": "ALLOW",
   "risk_score": 0.28,
   "reasons": ["injection: risk=0.56"],
-  "layers": [ "...per-layer detail..." ],
+  "layers": ["...per-layer detail..."],
   "document_job_id": "88632a8e-4dbe-49c4-9895-5efbd5b4fa19"
 }
 ```
 
-Response-mapping shape (pseudocode; adapt to the specific flow engine's
-syntax):
-
-```
+```text
 responseMapping:
   decision   -> $.decision
   risk_score -> $.risk_score
@@ -321,35 +491,66 @@ branch on decision:
   DENY    -> fail path
 ```
 
-The call must respect the flow engine's `failOnError` semantics -- decide
-explicitly whether a service error should fail the flow open or closed
-(a config-level fail posture is not yet implemented; see the layers'
-`demonstrator` scores as a proxy for confidence in the interim).
+- Respect the flow engine's `failOnError` semantics — decide fail-open vs
+  fail-closed explicitly
+- A config-level fail posture is **not yet implemented**; use the layers'
+  `demonstrator` flags and confidences as the interim signal
 
-### 2. Out-of-band (asynchronous) -- user-attribute update
+### 2. Out-of-band (asynchronous) — user-attribute write
 
-When the async document review settles (via `POST /review/{job_id}`), the
-service should push the result to the identity product as a custom
-`verification_status` user attribute (`UNVERIFIED | PROVISIONAL | VERIFIED |
-REJECTED`), updated **after the login/onboarding flow has already ended** --
-this is what makes the async tier possible without holding a flow open.
+Implemented and **verified against a running ThunderID**, behind a narrow
+adapter (`app/integrations/thunderid_client.py`).
 
+- **Off by default** (`ThunderIdSettings.enabled = False`) — a null
+  implementation logs intent and returns `False`, so "not configured" can never
+  be mistaken for "written"
+- Written on async settle: reviewer decision, or automated MRZ rejection
+
+| | |
+|---|---|
+| Attribute | `verification_status` (configurable) |
+| Values | `UNVERIFIED` / `PROVISIONAL` / `VERIFIED` / `REJECTED` |
+| Source of truth | TrustGate's local state store |
+| User matched by | `username` (configurable; `id` treats `user_ref` as the ThunderID user id) |
+
+The value written is always `VerificationState.value` — the same enum the local
+store uses, so the two cannot drift in representation.
+
+**Three behaviours the adapter exists to handle** (all confirmed against a real
+server, not read off the spec):
+
+1. **Token requests need an RFC 8707 `resource` parameter**, else
+   `invalid_target`
+2. **`PUT /users/{id}` is a full replace** — requires `ouId` and `type`, so
+   every update is a read-modify-write
+3. **Unregistered attributes are dropped silently, with a `200`.** The adapter
+   therefore **reads the attribute back** and treats a mismatch as failure,
+   rather than reporting a success that did not happen
+
+**Failure handling:**
+
+- Transient failures retried with backoff
+- Permanent failures fail fast (unknown user, ambiguous match, missing scope,
+  rejected attribute)
+- An ambiguous username match **refuses to write** — putting verification state
+  on the wrong account is worse than not writing it
+- Returns `False`, never raises: the local store is the system of record and the
+  verification has already settled, so an unreachable ThunderID must not undo it
+  or fail a reviewer's action
+
+**Session/token caveat:** flipping `verification_status` out of band does not
+change an already-issued token. Either the user picks it up on next
+login/refresh, or the downstream app reads `verification_status` live when
+gating sensitive actions.
+
+---
+
+## Tests
+
+```bash
+pytest             # fast suite, no network or model downloads
+pytest -m slow     # real model inference; needs images you supply
 ```
-async settle (this service)
-  -> call identity product's user-management API
-       PATCH /users/{id}  { "attributes": { "verification_status": "VERIFIED" } }
-  -> downstream app reacts (unlock full access / notify user)
-```
 
-The exact endpoint path and auth scheme (client-credentials token vs. an
-admin API key) for the target identity product are not yet wired up --
-that integration is a later milestone, gated on confirming the specifics
-from that product's own API reference. The adapter boundary (a thin,
-mockable client) is where that will land; nothing in this service's own
-state machine depends on it.
-
-**Session/token caveat:** flipping `verification_status` out-of-band does
-not retroactively change a token already issued to the user. Either the
-user picks up the new status on their next login/token refresh, or any
-downstream app gating sensitive actions must read `verification_status`
-live rather than trusting a cached claim from an older token.
+`slow` tests skip cleanly when their images are absent — see
+[samples/README.md](samples/README.md).

@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 from app.core.contracts import DocumentJobStatus, VerificationState
+from app.integrations.thunderid_client import NullThunderIdClient, ThunderIdClient
 from app.layers.document_review import MrzFormatError, parse_mrz
 from app.state.document_job_store import DocumentJobStore
 from app.state.store import IllegalStateTransition, VerificationStateStore
@@ -98,9 +99,15 @@ class DocumentReviewWorker:
     access while the document is still being checked.
     """
 
-    def __init__(self, job_store: DocumentJobStore, state_store: VerificationStateStore) -> None:
+    def __init__(
+        self,
+        job_store: DocumentJobStore,
+        state_store: VerificationStateStore,
+        thunderid_client: ThunderIdClient | None = None,
+    ) -> None:
         self._job_store = job_store
         self._state_store = state_store
+        self._thunderid = thunderid_client or NullThunderIdClient()
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._task: asyncio.Task | None = None
 
@@ -125,6 +132,10 @@ class DocumentReviewWorker:
                 # Already settled (e.g. the sync tier rejected them first);
                 # the job outcome still stands.
                 logger.info("user %s already in a terminal state; job %s stays REJECTED", job.user_ref, job_id)
+
+            # Out-of-band propagation: the login flow ended long ago, so this is
+            # how the identity product learns the outcome.
+            await self._thunderid.update_verification_status(job.user_ref, VerificationState.REJECTED)
 
         logger.info("document job %s -> %s (%s)", job_id, status.value, "; ".join(findings))
 

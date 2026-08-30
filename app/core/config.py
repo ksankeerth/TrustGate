@@ -81,6 +81,33 @@ class InjectionSettings(BaseModel):
 
 default_injection_settings = InjectionSettings()
 
+
+class ThunderIdSettings(BaseModel):
+    # Off by default so the service runs standalone; the tests and the default
+    # app never reach for a network.
+    enabled: bool = False
+    base_url: str = "https://localhost:8090"
+    client_id: str = "TRUSTGATE"
+    client_secret: str = "trustgate-local-client-secret"
+    # RFC 8707 resource indicator. ThunderID rejects token requests without it
+    # ("invalid_target"); the value is the System resource server's identifier.
+    resource: str = "https://localhost:8090/mcp"
+    scope: str = "system"
+    # Which ThunderID user attribute a TrustGate user_ref is matched against.
+    # Set to "id" to treat user_ref as the ThunderID user id directly.
+    user_lookup_attribute: str = "username"
+    attribute_name: str = "verification_status"
+    # ThunderID serves HTTPS with a self-signed certificate locally.
+    verify_tls: bool = False
+    timeout_seconds: float = 10.0
+    max_attempts: int = 3
+    retry_backoff_seconds: float = 0.5
+    # Refresh a token this many seconds before it actually expires.
+    token_expiry_margin_seconds: float = 30.0
+
+
+default_thunderid_settings = ThunderIdSettings()
+
 # Load-either real deepfake checkpoints: both are Apache-2.0, ungated, and
 # expose a "fake"-containing label somewhere in id2label so the layer can
 # normalize native label order without per-model special-casing.
