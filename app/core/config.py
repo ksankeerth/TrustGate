@@ -1,5 +1,7 @@
 from pydantic import BaseModel
 
+from app.core.contracts import FailPosture
+
 
 class AggregatorSettings(BaseModel):
     layer_weights: dict[str, float] = {
@@ -122,6 +124,21 @@ class LatencySettings(BaseModel):
 
 
 default_latency_settings = LatencySettings()
+
+
+class ResilienceSettings(BaseModel):
+    """How the sync tier behaves when a layer cannot produce a result.
+
+    Defaults to FAIL_CLOSED: this is a security control, so a check that did
+    not run must not be treated as a check that passed. Deployments that value
+    availability over strictness can flip it, accepting that an attacker able
+    to induce a layer error can shed that layer's opinion.
+    """
+
+    layer_fail_posture: FailPosture = FailPosture.FAIL_CLOSED
+
+
+default_resilience_settings = ResilienceSettings()
 
 # Load-either real deepfake checkpoints: both are Apache-2.0, ungated, and
 # expose a "fake"-containing label somewhere in id2label so the layer can

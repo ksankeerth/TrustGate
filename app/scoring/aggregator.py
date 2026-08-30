@@ -29,15 +29,23 @@ def aggregate(
             reasons.append(f"{result.layer}: {result.reason} (risk={result.risk:.2f})")
 
     risk_score = weighted_sum / weight_total if weight_total > 0 else 0.0
-
-    if risk_score <= settings.allow_threshold:
-        decision = Decision.ALLOW
-    elif risk_score <= settings.step_up_threshold:
-        decision = Decision.STEP_UP
-    else:
-        decision = Decision.DENY
+    decision = decide(risk_score, settings)
 
     if not reasons:
         reasons.append("all layers within acceptable risk range")
 
     return risk_score, decision, reasons
+
+
+def decide(risk_score: float, settings: AggregatorSettings = default_settings) -> Decision:
+    """Map a risk score onto a decision band.
+
+    Kept separate so any caller that adjusts a score afterwards derives the
+    decision the same way, rather than the score and the verdict drifting
+    apart.
+    """
+    if risk_score <= settings.allow_threshold:
+        return Decision.ALLOW
+    if risk_score <= settings.step_up_threshold:
+        return Decision.STEP_UP
+    return Decision.DENY

@@ -18,6 +18,22 @@ class Decision(str, Enum):
     DENY = "DENY"
 
 
+class FailPosture(str, Enum):
+    """What a layer's failure means for the overall decision.
+
+    FAIL_CLOSED — an unusable layer counts as maximum risk. A verification
+    check that did not run has not passed, and an attacker who can induce
+    errors must not thereby weaken the decision.
+
+    FAIL_OPEN — an unusable layer is excluded from scoring entirely (zero
+    weight), leaving the remaining layers to decide. Favours availability, at
+    the cost of making error-induction a viable way to shed a check.
+    """
+
+    FAIL_CLOSED = "FAIL_CLOSED"
+    FAIL_OPEN = "FAIL_OPEN"
+
+
 class DocumentJobStatus(str, Enum):
     PENDING = "PENDING"  # queued, automated checks not yet run
     AWAITING_REVIEW = "AWAITING_REVIEW"  # automated checks done, needs a human decision

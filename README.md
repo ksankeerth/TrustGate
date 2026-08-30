@@ -254,6 +254,36 @@ Exercise the whole flow against a running server:
 
 ---
 
+## Fail posture
+
+What happens when a layer cannot produce a result — a model fails to load, an
+inference throws, a bug escapes. Configured by
+`ResilienceSettings.layer_fail_posture`.
+
+**A broken layer never fails the request.** Layer coroutines are gathered with
+`return_exceptions`, so one failure is converted into a `LayerResult` rather
+than propagating: a single buggy layer cannot 500 the whole verification.
+
+| Posture | A failed layer... | Effect |
+|---|---|---|
+| `FAIL_CLOSED` *(default)* | counts as maximum risk, at full confidence | the attempt cannot be cleanly approved |
+| `FAIL_OPEN` | is excluded from scoring entirely (zero weight) | the remaining layers decide alone |
+
+**Why FAIL_CLOSED is the default:** this is a security control, so a check that
+did not run must not be treated as a check that passed. Otherwise an attacker
+who can reliably induce an error in one layer has found a way to shed it.
+
+**The floor.** Scoring by weighted mean alone lets three healthy layers dilute
+one that never ran, which can still land in ALLOW. Under `FAIL_CLOSED` the
+aggregate risk is therefore floored just into `STEP_UP` — a failure downgrades
+to "ask for more", not "approve anyway". It floors the *score* rather than
+overriding the *decision*, so `risk_score` and `decision` never disagree.
+
+`FAIL_OPEN` favours availability and accepts the trade. Note where it
+degenerates: if *every* layer fails, nothing carries weight, the score is 0.0
+and the result is ALLOW — an empty verification approving by default. That is
+the honest consequence of the setting, and the reason it is not the default.
+
 ## Latency
 
 The sync tier is what the login flow waits on, so it is measured rather than
@@ -497,10 +527,10 @@ branch on decision:
   DENY    -> fail path
 ```
 
-- Respect the flow engine's `failOnError` semantics — decide fail-open vs
-  fail-closed explicitly
-- A config-level fail posture is **not yet implemented**; use the layers'
-  `demonstrator` flags and confidences as the interim signal
+- Respect the flow engine's `failOnError` semantics for the case where
+  TrustGate itself is unreachable — that is the caller's decision, not this
+  service's
+- For a *layer* failing inside TrustGate, see Fail posture below
 
 ### 2. Out-of-band (asynchronous) — user-attribute write
 
