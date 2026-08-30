@@ -14,36 +14,27 @@ an asynchronous document-review tier.
 
 ## Architecture at a glance
 
-```text
-   CLIENT                IDENTITY PRODUCT            TRUSTGATE
-   (app / browser)       (ThunderID :8090)           (FastAPI :8000)
-        |                       |                          |
-   1    |--- start login ------>|                          |
-        |                       |                          |
-   2    |--- GET /challenge ---------------------------->  |
-        |  <---------------- nonce + prompt sequence ----  |
-        |                       |                          |
-   3    |  capture selfie / ID / frames, bind to nonce     |
-        |                       |                          |
-   4    |--- submit ----------> |--- POST /verify ------>  |
-        |                       |                          |
-        |                       |                     sync tier
-        |                       |                     4 layers
-        |                       |                          |
-        |                       |  <-- decision, risk ---  |
-   5    |  <-- ALLOW / STEP_UP / DENY --                   |
-        |                       |                          |
-        |                       |                   queue doc job
-        |                       |                          |
-        =========  login flow ENDS, user is PROVISIONAL  =========
-        |                       |                          |
-        |                       |                     async tier
-        |                       |                    MRZ + human
-        |                       |                          |
-   6    |                       |  <-- PUT /users/{id} --  |
-        |                       |      verification_status |
-        |                       |                          |
-   7    |  <-- full access ---- |                          |
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'background':'#ffffff','primaryColor':'#ffffff','primaryTextColor':'#000000','primaryBorderColor':'#000000','secondaryColor':'#ffffff','secondaryTextColor':'#000000','secondaryBorderColor':'#000000','tertiaryColor':'#ffffff','tertiaryTextColor':'#000000','tertiaryBorderColor':'#000000','lineColor':'#000000','textColor':'#000000','mainBkg':'#ffffff','nodeBorder':'#000000','clusterBkg':'#ffffff','clusterBorder':'#000000','edgeLabelBackground':'#ffffff','labelBoxBkgColor':'#ffffff','labelBoxBorderColor':'#000000','labelTextColor':'#000000','actorBkg':'#ffffff','actorBorder':'#000000','actorTextColor':'#000000','actorLineColor':'#000000','signalColor':'#000000','signalTextColor':'#000000','noteBkgColor':'#ffffff','noteBorderColor':'#000000','noteTextColor':'#000000','activationBkgColor':'#ffffff','activationBorderColor':'#000000','sequenceNumberColor':'#ffffff','altSectionBkgColor':'#ffffff','loopTextColor':'#000000','altBackground':'#ffffff','compositeBackground':'#ffffff','compositeTitleBackground':'#ffffff','compositeBorder':'#000000','stateBkg':'#ffffff','stateBorder':'#000000','stateLabelColor':'#000000','labelBackgroundColor':'#ffffff','transitionColor':'#000000','transitionLabelColor':'#000000','innerEndBackground':'#000000','specialStateColor':'#000000','defaultLinkColor':'#000000','titleColor':'#000000','nodeTextColor':'#000000'}}}%%
+sequenceDiagram
+    autonumber
+    participant C as Client<br/>(app / browser)
+    participant T as ThunderID<br/>:8090
+    participant G as TrustGate<br/>:8000
+
+    C->>T: start login
+    C->>G: POST /challenge
+    G-->>C: nonce + prompt sequence
+    Note over C: capture selfie / ID / frames,<br/>bind frames to the nonce
+    C->>T: submit
+    T->>G: POST /verify
+    Note over G: SYNC TIER<br/>4 layers, concurrent
+    G-->>T: decision + risk_score
+    T-->>C: ALLOW / STEP_UP / DENY
+    Note over C,G: login flow ENDS -- user holds PROVISIONAL access
+    Note over G: ASYNC TIER<br/>MRZ checks + human review
+    G->>T: PUT /users/{id} verification_status
+    T-->>C: full access unlocked
 ```
 
 **The key idea:** step 5 ends the flow. Steps 6–7 happen with *no flow running* —
@@ -54,56 +45,33 @@ without holding a login open.
 
 ## Sync tier pipeline
 
-```text
-  POST /verify
-    |
-    |   challenge_id . user_ref . selfie . id_photo
-    |   liveness_frames[] . frame_binding . mrz_text
-    |
-    v
-  +=== FAN OUT: all four layers run concurrently (asyncio.gather) ========+
-  |                                                                       |
-  |   face_match                                    in: selfie + id_photo |
-  |      MTCNN --crop/align--> InceptionResnetV1 (vggface2)               |
-  |            --> two 512-d embeddings --> cosine similarity             |
-  |      out:  risk anchored so similarity == threshold  ->  0.50         |
-  |            confidence = MTCNN face-detection probability              |
-  |                                                                       |
-  |   deepfake                                              in: selfie    |
-  |      SigLIP2  OR  ViT   (load-either, identical interface)            |
-  |            --> fake_probability                                       |
-  |      out:  risk = fake_probability, confidence = max softmax          |
-  |                                                                       |
-  |   liveness                          in: frames + challenge  [DEMO]    |
-  |      challenge fresh?  single-use?  HMAC frame-binding valid?         |
-  |      inter-frame pixel delta above the static-image floor?            |
-  |      out:  risk = worst finding, floored at 0.20; confidence 0.35     |
-  |                                                                       |
-  |   injection                         in: selfie + frames     [DEMO]    |
-  |      EXIF provenance . frame uniformity . sensor-noise floor          |
-  |      out:  risk = worst finding, floored at 0.30; confidence 0.20     |
-  |                                                                       |
-  +=== FAN IN: total latency = slowest layer, NOT the sum ================+
-    |
-    |   four LayerResults: { risk, confidence, ok, reason, demonstrator }
-    v
-  AGGREGATOR
-    |
-    |   weighted mean of the four risks; each layer's weight is
-    |
-    |         layer_weight  x  confidence  x  (0.5 if demonstrator)
-    |
-    |   so an unsure or deliberately weak layer moves the score less
-    |   than a confident production-grade one
-    v
-  risk_score
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'background':'#ffffff','primaryColor':'#ffffff','primaryTextColor':'#000000','primaryBorderColor':'#000000','secondaryColor':'#ffffff','secondaryTextColor':'#000000','secondaryBorderColor':'#000000','tertiaryColor':'#ffffff','tertiaryTextColor':'#000000','tertiaryBorderColor':'#000000','lineColor':'#000000','textColor':'#000000','mainBkg':'#ffffff','nodeBorder':'#000000','clusterBkg':'#ffffff','clusterBorder':'#000000','edgeLabelBackground':'#ffffff','labelBoxBkgColor':'#ffffff','labelBoxBorderColor':'#000000','labelTextColor':'#000000','actorBkg':'#ffffff','actorBorder':'#000000','actorTextColor':'#000000','actorLineColor':'#000000','signalColor':'#000000','signalTextColor':'#000000','noteBkgColor':'#ffffff','noteBorderColor':'#000000','noteTextColor':'#000000','activationBkgColor':'#ffffff','activationBorderColor':'#000000','sequenceNumberColor':'#ffffff','altSectionBkgColor':'#ffffff','loopTextColor':'#000000','altBackground':'#ffffff','compositeBackground':'#ffffff','compositeTitleBackground':'#ffffff','compositeBorder':'#000000','stateBkg':'#ffffff','stateBorder':'#000000','stateLabelColor':'#000000','labelBackgroundColor':'#ffffff','transitionColor':'#000000','transitionLabelColor':'#000000','innerEndBackground':'#000000','specialStateColor':'#000000','defaultLinkColor':'#000000','titleColor':'#000000','nodeTextColor':'#000000'}}}%%
+flowchart TB
+    REQ["POST /verify<br/>selfie · id_photo · frames · challenge"]
 
-    0.0 ------------- 0.30 ------------- 0.70 ------------- 1.0
-     |    ALLOW        |    STEP_UP       |     DENY         |
-     |                 |                  |                  |
-     |  continue flow  |  OTP / passkey   |  fail path       |
-     |                 |                  |                  |
-     |   PROVISIONAL   |   PROVISIONAL    |   REJECTED       |
+    subgraph CONC ["FAN OUT — all four run concurrently (asyncio.gather)"]
+        direction LR
+        FM["<b>face_match</b><br/>in: selfie + id_photo<br/>MTCNN crop/align<br/>InceptionResnetV1 (vggface2)<br/>two 512-d embeddings<br/>cosine similarity"]
+        DF["<b>deepfake</b><br/>in: selfie<br/>SigLIP2 OR ViT<br/>(load-either)<br/>fake_probability"]
+        LV["<b>liveness</b> [DEMO]<br/>in: frames + challenge<br/>fresh? single-use?<br/>HMAC binding valid?<br/>inter-frame delta"]
+        IJ["<b>injection</b> [DEMO]<br/>in: selfie + frames<br/>EXIF provenance<br/>frame uniformity<br/>sensor noise"]
+        FM ~~~ DF ~~~ LV ~~~ IJ
+    end
+
+    AGG["<b>AGGREGATOR</b><br/>weighted mean of four risks<br/>weight = layer_weight × confidence × (0.5 if demonstrator)"]
+    SCORE["risk_score  0.0 .. 1.0"]
+
+    A["<b>ALLOW</b>  risk ≤ 0.30<br/>continue flow<br/>state: PROVISIONAL"]
+    S["<b>STEP_UP</b>  0.30 &lt; risk ≤ 0.70<br/>OTP / passkey<br/>state: PROVISIONAL"]
+    D["<b>DENY</b>  risk &gt; 0.70<br/>fail path<br/>state: REJECTED"]
+
+    REQ --> CONC
+    CONC -- "4 × LayerResult<br/>{risk, confidence, ok, reason, demonstrator}<br/>latency = slowest layer, not the sum" --> AGG
+    AGG --> SCORE
+    SCORE --> A
+    SCORE --> S
+    SCORE --> D
 ```
 
 ### Layers and models
@@ -134,45 +102,43 @@ active.
 
 ## Async tier pipeline
 
-```text
-   POST /verify (id_photo)        POST /verify/document/async
-              |                              |
-              '--------------.---------------'
-                             |
-                  job queued, response returns at once
-                             |
-                    in-process worker (asyncio queue)
-                             |
-                      mrz_text supplied?
-                             |
-            .----------------'----------------.
-           yes                                no
-            |                                 |
-        MRZ parse                     tesseract installed?
-     ICAO Doc 9303                            |
-    TD1 / TD2 / TD3                  .--------'--------.
-            |                       yes                no
-    check digits valid?              |                 |
-            |                    OCR image      nothing to check
-      .-----'-----.                  |                 |
-     no          yes                 |                 |
-      |           |                  |                 |
-      |           '------------------'-----------------'
-      |                              |
-  AUTO-REJECT                 AWAITING_REVIEW
-  deterministic          human settles via POST /review
-  no reviewer time                    |
-      |                     .---------'---------.
-      |                   ALLOW               DENY
-      |                     |                   |
-      v                     v                   v
-  REJECTED              VERIFIED            REJECTED
-      |                     |                   |
-      '---------------------'-------------------'
-                            |
-              PUT /users/{id}  verification_status
-                            |
-                        ThunderID
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'background':'#ffffff','primaryColor':'#ffffff','primaryTextColor':'#000000','primaryBorderColor':'#000000','secondaryColor':'#ffffff','secondaryTextColor':'#000000','secondaryBorderColor':'#000000','tertiaryColor':'#ffffff','tertiaryTextColor':'#000000','tertiaryBorderColor':'#000000','lineColor':'#000000','textColor':'#000000','mainBkg':'#ffffff','nodeBorder':'#000000','clusterBkg':'#ffffff','clusterBorder':'#000000','edgeLabelBackground':'#ffffff','labelBoxBkgColor':'#ffffff','labelBoxBorderColor':'#000000','labelTextColor':'#000000','actorBkg':'#ffffff','actorBorder':'#000000','actorTextColor':'#000000','actorLineColor':'#000000','signalColor':'#000000','signalTextColor':'#000000','noteBkgColor':'#ffffff','noteBorderColor':'#000000','noteTextColor':'#000000','activationBkgColor':'#ffffff','activationBorderColor':'#000000','sequenceNumberColor':'#ffffff','altSectionBkgColor':'#ffffff','loopTextColor':'#000000','altBackground':'#ffffff','compositeBackground':'#ffffff','compositeTitleBackground':'#ffffff','compositeBorder':'#000000','stateBkg':'#ffffff','stateBorder':'#000000','stateLabelColor':'#000000','labelBackgroundColor':'#ffffff','transitionColor':'#000000','transitionLabelColor':'#000000','innerEndBackground':'#000000','specialStateColor':'#000000','defaultLinkColor':'#000000','titleColor':'#000000','nodeTextColor':'#000000'}}}%%
+flowchart TB
+    V["POST /verify<br/>(id_photo present)"]
+    A["POST /verify/document/async"]
+    Q["job queued — response returns at once<br/>in-process worker, asyncio queue"]
+    M{"mrz_text supplied?"}
+    OCRQ{"tesseract installed?"}
+    OCR["OCR the image"]
+    NONE["nothing could be checked<br/>(never reported as a pass)"]
+    P["MRZ parse — ICAO Doc 9303<br/>TD1 / TD2 / TD3"]
+    CD{"check digits valid?"}
+    AR["<b>AUTO-REJECT</b><br/>deterministic, no reviewer time"]
+    AW["<b>AWAITING_REVIEW</b><br/>human settles via POST /review"]
+    RJ1["REJECTED"]
+    VF["VERIFIED"]
+    RJ2["REJECTED"]
+    TID["PUT /users/id — verification_status<br/>→ ThunderID"]
+
+    V --> Q
+    A --> Q
+    Q --> M
+    M -- yes --> P
+    M -- no --> OCRQ
+    OCRQ -- yes --> OCR
+    OCRQ -- no --> NONE
+    OCR --> P
+    P --> CD
+    CD -- no --> AR
+    CD -- yes --> AW
+    NONE --> AW
+    AR --> RJ1
+    AW -- ALLOW --> VF
+    AW -- DENY --> RJ2
+    RJ1 --> TID
+    VF --> TID
+    RJ2 --> TID
 ```
 
 Poll `GET /document/{job_id}` for status, findings and extracted MRZ fields.
@@ -184,78 +150,62 @@ Poll `GET /document/{job_id}` for status, findings and extracted MRZ fields.
 `./deployment/start-all.sh` runs both services on one machine, so TrustGate is
 developed against the real identity product rather than a mock.
 
-```text
-  ONE MACHINE (macOS / Linux)
-
-  +---------------------------+          +----------------------------+
-  |  ThunderID  v1.0.1        |          |  TrustGate                 |
-  |  Go binary + SQLite       |          |  uvicorn / FastAPI         |
-  |  HTTPS :8090 self-signed  |          |  HTTP  :8000               |
-  |                           |          |                            |
-  |  /console       admin UI  |          |  /challenge   /verify      |
-  |  /oauth2/token  OAuth2    |          |  /document    /review      |
-  |  /users         mgmt API  |          |  /status      /health      |
-  |  /health/liveness         |          |                            |
-  +---------------------------+          +----------------------------+
-
-  How TrustGate talks to ThunderID when a verification settles:
-
-     TrustGate                                          ThunderID
-         |                                                   |
-    1    |  POST /oauth2/token                               |
-         |  Basic(client_id, client_secret)                  |
-         |  grant_type=client_credentials                    |
-         |  scope=system   resource=<base>/mcp               |
-         |-------------------------------------------------->|
-         |<--------------------------------------------------|
-         |  access_token   scope: system   (cached)          |
-         |                                                   |
-    2    |  GET /users?filter=username eq "<user_ref>"       |
-         |-------------------------------------------------->|
-         |<--------------------------------------------------|
-         |  { id, ouId, type, attributes }   <- need all     |
-         |                                                   |
-    3    |  PUT /users/{id}       full replace, not a patch   |
-         |  { ouId, type, attributes: { ..., status } }      |
-         |-------------------------------------------------->|
-         |<--------------------------------------------------|
-         |  200 + stored attributes                          |
-         |                                                   |
-    4    |  read back and compare                            |
-         |  a 200 does NOT mean it was stored -- an          |
-         |  unregistered attribute is dropped silently       |
-         |                                                   |
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'background':'#ffffff','primaryColor':'#ffffff','primaryTextColor':'#000000','primaryBorderColor':'#000000','secondaryColor':'#ffffff','secondaryTextColor':'#000000','secondaryBorderColor':'#000000','tertiaryColor':'#ffffff','tertiaryTextColor':'#000000','tertiaryBorderColor':'#000000','lineColor':'#000000','textColor':'#000000','mainBkg':'#ffffff','nodeBorder':'#000000','clusterBkg':'#ffffff','clusterBorder':'#000000','edgeLabelBackground':'#ffffff','labelBoxBkgColor':'#ffffff','labelBoxBorderColor':'#000000','labelTextColor':'#000000','actorBkg':'#ffffff','actorBorder':'#000000','actorTextColor':'#000000','actorLineColor':'#000000','signalColor':'#000000','signalTextColor':'#000000','noteBkgColor':'#ffffff','noteBorderColor':'#000000','noteTextColor':'#000000','activationBkgColor':'#ffffff','activationBorderColor':'#000000','sequenceNumberColor':'#ffffff','altSectionBkgColor':'#ffffff','loopTextColor':'#000000','altBackground':'#ffffff','compositeBackground':'#ffffff','compositeTitleBackground':'#ffffff','compositeBorder':'#000000','stateBkg':'#ffffff','stateBorder':'#000000','stateLabelColor':'#000000','labelBackgroundColor':'#ffffff','transitionColor':'#000000','transitionLabelColor':'#000000','innerEndBackground':'#000000','specialStateColor':'#000000','defaultLinkColor':'#000000','titleColor':'#000000','nodeTextColor':'#000000'}}}%%
+flowchart LR
+    subgraph BOX ["ONE MACHINE (macOS / Linux)"]
+        direction LR
+        TID["<b>ThunderID v1.0.1</b><br/>Go binary + SQLite<br/>HTTPS :8090 (self-signed)<br/><br/>/console — admin UI<br/>/oauth2/token — OAuth2<br/>/users — management API<br/>/health/liveness"]
+        TG["<b>TrustGate</b><br/>uvicorn / FastAPI<br/>HTTP :8000<br/><br/>/challenge  /verify<br/>/document   /review<br/>/status     /health"]
+        TG -- "OAuth2 client_credentials<br/>then read + write user attributes" --> TID
+    end
 ```
 
-```text
-  deployment/
-    dist/                          ThunderID distribution  (gitignored ~115MB)
-    run/                           logs + pid files        (gitignored)
-    resources/trustgate-app.yaml   applied at ThunderID startup
-    provision_thunderid.py         run once ThunderID is up
+How TrustGate writes a settled verification back:
+
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'background':'#ffffff','primaryColor':'#ffffff','primaryTextColor':'#000000','primaryBorderColor':'#000000','secondaryColor':'#ffffff','secondaryTextColor':'#000000','secondaryBorderColor':'#000000','tertiaryColor':'#ffffff','tertiaryTextColor':'#000000','tertiaryBorderColor':'#000000','lineColor':'#000000','textColor':'#000000','mainBkg':'#ffffff','nodeBorder':'#000000','clusterBkg':'#ffffff','clusterBorder':'#000000','edgeLabelBackground':'#ffffff','labelBoxBkgColor':'#ffffff','labelBoxBorderColor':'#000000','labelTextColor':'#000000','actorBkg':'#ffffff','actorBorder':'#000000','actorTextColor':'#000000','actorLineColor':'#000000','signalColor':'#000000','signalTextColor':'#000000','noteBkgColor':'#ffffff','noteBorderColor':'#000000','noteTextColor':'#000000','activationBkgColor':'#ffffff','activationBorderColor':'#000000','sequenceNumberColor':'#ffffff','altSectionBkgColor':'#ffffff','loopTextColor':'#000000','altBackground':'#ffffff','compositeBackground':'#ffffff','compositeTitleBackground':'#ffffff','compositeBorder':'#000000','stateBkg':'#ffffff','stateBorder':'#000000','stateLabelColor':'#000000','labelBackgroundColor':'#ffffff','transitionColor':'#000000','transitionLabelColor':'#000000','innerEndBackground':'#000000','specialStateColor':'#000000','defaultLinkColor':'#000000','titleColor':'#000000','nodeTextColor':'#000000'}}}%%
+sequenceDiagram
+    autonumber
+    participant G as TrustGate
+    participant T as ThunderID
+
+    G->>T: POST /oauth2/token<br/>Basic(client_id, client_secret)<br/>grant_type=client_credentials<br/>scope=system  resource=BASE_URL/mcp
+    T-->>G: access_token (scope: system) — cached
+    G->>T: GET /users?filter=username eq "user_ref"
+    T-->>G: id, ouId, type, attributes
+    Note over G: PUT is a full replace, so ouId,<br/>type and existing attributes must<br/>all be sent back
+    G->>T: PUT /users/id<br/>ouId, type, attributes + verification_status
+    T-->>G: 200 + stored attributes
+    Note over G,T: read back and compare — a 200 does NOT mean it was<br/>stored. An unregistered attribute is dropped silently
 ```
+
+| Path | Purpose |
+|---|---|
+| `deployment/dist/` | Unpacked ThunderID distribution — gitignored, ~115MB |
+| `deployment/run/` | Logs and pid files — gitignored |
+| `deployment/resources/trustgate-app.yaml` | Applied at ThunderID startup |
+| `deployment/provision_thunderid.py` | Run once ThunderID is up |
 
 ### Startup sequence
 
-```text
-  fetch-thunderid.sh          detect OS/arch -> download release -> unpack
-          |
-  start-all.sh
-          |
-          +-- (first run only) ThunderID setup.sh
-          |       generates config/certs/, seeds resources, creates admin
-          |       WITHOUT THIS: start.sh fails on missing crypto.key
-          |
-          +-- ThunderID start.sh <resources/trustgate-app.yaml>
-          |       registers TrustGate m2m app + role granting `system`
-          |       poll https://localhost:8090/health/liveness
-          |
-          +-- provision_thunderid.py
-          |       adds verification_status to the Person user-type schema
-          |       WITHOUT THIS: attribute writes return 200 and store nothing
-          |
-          +-- TrustGate uvicorn
-                  poll http://127.0.0.1:8000/health
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'background':'#ffffff','primaryColor':'#ffffff','primaryTextColor':'#000000','primaryBorderColor':'#000000','secondaryColor':'#ffffff','secondaryTextColor':'#000000','secondaryBorderColor':'#000000','tertiaryColor':'#ffffff','tertiaryTextColor':'#000000','tertiaryBorderColor':'#000000','lineColor':'#000000','textColor':'#000000','mainBkg':'#ffffff','nodeBorder':'#000000','clusterBkg':'#ffffff','clusterBorder':'#000000','edgeLabelBackground':'#ffffff','labelBoxBkgColor':'#ffffff','labelBoxBorderColor':'#000000','labelTextColor':'#000000','actorBkg':'#ffffff','actorBorder':'#000000','actorTextColor':'#000000','actorLineColor':'#000000','signalColor':'#000000','signalTextColor':'#000000','noteBkgColor':'#ffffff','noteBorderColor':'#000000','noteTextColor':'#000000','activationBkgColor':'#ffffff','activationBorderColor':'#000000','sequenceNumberColor':'#ffffff','altSectionBkgColor':'#ffffff','loopTextColor':'#000000','altBackground':'#ffffff','compositeBackground':'#ffffff','compositeTitleBackground':'#ffffff','compositeBorder':'#000000','stateBkg':'#ffffff','stateBorder':'#000000','stateLabelColor':'#000000','labelBackgroundColor':'#ffffff','transitionColor':'#000000','transitionLabelColor':'#000000','innerEndBackground':'#000000','specialStateColor':'#000000','defaultLinkColor':'#000000','titleColor':'#000000','nodeTextColor':'#000000'}}}%%
+flowchart TB
+    F["<b>fetch-thunderid.sh</b><br/>detect OS/arch → download release → unpack"]
+    S1["<b>ThunderID setup.sh</b> (first run only)<br/>generates config/certs/, seeds resources, creates admin"]
+    S1W["without this: start.sh fails on a missing crypto.key"]
+    S2["<b>ThunderID start.sh</b> resources/trustgate-app.yaml<br/>registers the TrustGate m2m app + role granting 'system'<br/>poll /health/liveness"]
+    S3["<b>provision_thunderid.py</b><br/>adds verification_status to the Person user-type schema"]
+    S3W["without this: attribute writes return 200 and store nothing"]
+    S4["<b>TrustGate uvicorn</b><br/>poll /health"]
+
+    F --> S1
+    S1 -.-> S1W
+    S1 --> S2
+    S2 --> S3
+    S3 -.-> S3W
+    S3 --> S4
 ```
 
 Both services are launched detached (`nohup`, own process group), so they
@@ -322,13 +272,18 @@ Exercise the whole flow against a running server:
 
 ### Verification state machine
 
-```text
-                    sync tier passes            async review passes
-   UNVERIFIED --------------------> PROVISIONAL -------------------> VERIFIED
-       |                                 |
-       | sync tier fails (DENY)          | async review fails
-       |                                 |
-       +------------> REJECTED <---------+
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'background':'#ffffff','primaryColor':'#ffffff','primaryTextColor':'#000000','primaryBorderColor':'#000000','secondaryColor':'#ffffff','secondaryTextColor':'#000000','secondaryBorderColor':'#000000','tertiaryColor':'#ffffff','tertiaryTextColor':'#000000','tertiaryBorderColor':'#000000','lineColor':'#000000','textColor':'#000000','mainBkg':'#ffffff','nodeBorder':'#000000','clusterBkg':'#ffffff','clusterBorder':'#000000','edgeLabelBackground':'#ffffff','labelBoxBkgColor':'#ffffff','labelBoxBorderColor':'#000000','labelTextColor':'#000000','actorBkg':'#ffffff','actorBorder':'#000000','actorTextColor':'#000000','actorLineColor':'#000000','signalColor':'#000000','signalTextColor':'#000000','noteBkgColor':'#ffffff','noteBorderColor':'#000000','noteTextColor':'#000000','activationBkgColor':'#ffffff','activationBorderColor':'#000000','sequenceNumberColor':'#ffffff','altSectionBkgColor':'#ffffff','loopTextColor':'#000000','altBackground':'#ffffff','compositeBackground':'#ffffff','compositeTitleBackground':'#ffffff','compositeBorder':'#000000','stateBkg':'#ffffff','stateBorder':'#000000','stateLabelColor':'#000000','labelBackgroundColor':'#ffffff','transitionColor':'#000000','transitionLabelColor':'#000000','innerEndBackground':'#000000','specialStateColor':'#000000','defaultLinkColor':'#000000','titleColor':'#000000','nodeTextColor':'#000000'}}}%%
+stateDiagram-v2
+    direction LR
+    [*] --> UNVERIFIED
+    UNVERIFIED --> PROVISIONAL: sync tier passes
+    UNVERIFIED --> REJECTED: sync tier fails (DENY)
+    PROVISIONAL --> PROVISIONAL: /verify retried (idempotent)
+    PROVISIONAL --> VERIFIED: async review passes
+    PROVISIONAL --> REJECTED: async review fails
+    VERIFIED --> [*]
+    REJECTED --> [*]
 ```
 
 - `VERIFIED` and `REJECTED` are **terminal**
@@ -336,10 +291,15 @@ Exercise the whole flow against a running server:
 
 ### Document job status
 
-```text
-   PENDING --> AWAITING_REVIEW --> VERIFIED | REJECTED
-       |
-       +-------> REJECTED          (automated checks failed)
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'background':'#ffffff','primaryColor':'#ffffff','primaryTextColor':'#000000','primaryBorderColor':'#000000','secondaryColor':'#ffffff','secondaryTextColor':'#000000','secondaryBorderColor':'#000000','tertiaryColor':'#ffffff','tertiaryTextColor':'#000000','tertiaryBorderColor':'#000000','lineColor':'#000000','textColor':'#000000','mainBkg':'#ffffff','nodeBorder':'#000000','clusterBkg':'#ffffff','clusterBorder':'#000000','edgeLabelBackground':'#ffffff','labelBoxBkgColor':'#ffffff','labelBoxBorderColor':'#000000','labelTextColor':'#000000','actorBkg':'#ffffff','actorBorder':'#000000','actorTextColor':'#000000','actorLineColor':'#000000','signalColor':'#000000','signalTextColor':'#000000','noteBkgColor':'#ffffff','noteBorderColor':'#000000','noteTextColor':'#000000','activationBkgColor':'#ffffff','activationBorderColor':'#000000','sequenceNumberColor':'#ffffff','altSectionBkgColor':'#ffffff','loopTextColor':'#000000','altBackground':'#ffffff','compositeBackground':'#ffffff','compositeTitleBackground':'#ffffff','compositeBorder':'#000000','stateBkg':'#ffffff','stateBorder':'#000000','stateLabelColor':'#000000','labelBackgroundColor':'#ffffff','transitionColor':'#000000','transitionLabelColor':'#000000','innerEndBackground':'#000000','specialStateColor':'#000000','defaultLinkColor':'#000000','titleColor':'#000000','nodeTextColor':'#000000'}}}%%
+stateDiagram-v2
+    direction LR
+    [*] --> PENDING
+    PENDING --> REJECTED: automated checks fail
+    PENDING --> AWAITING_REVIEW: valid MRZ, or nothing to check
+    AWAITING_REVIEW --> VERIFIED: reviewer ALLOW
+    AWAITING_REVIEW --> REJECTED: reviewer DENY
 ```
 
 A settled job cannot be reviewed again (`409`).
